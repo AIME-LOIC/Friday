@@ -1,0 +1,32 @@
+{
+  "assistant": {
+    "name": "Personal Assistant",
+    "version": "2.0",
+    "voice_speed": 150,
+    "voice_volume": 0.9
+  },
+  "microphone": {
+    "device_index": 0,
+    "energy_threshold": 4000,
+    "dynamic_energy": true
+  },
+  "speech_recognition": {
+    "language": "en-US",
+    "timeout": 10,
+    "phrase_limit": 15
+  },
+  "features": {
+    "voice_input": true,
+    "voice_output": true,
+    "web_search": true,
+    "weather": true,
+    "app_launcher": true,
+    "command_history": true
+  },
+  "customization": {
+    "gui_theme": "modern",
+    "log_level": "info",
+    "save_history": true,
+    "history_limit": 1000
+  }
+}
