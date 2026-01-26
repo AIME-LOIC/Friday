@@ -1,46 +1,96 @@
 import os
 import time
-import pygame
+import json
 import threading
 import queue
-import speech_recognition as sr
-from gtts import gTTS
-import subprocess
 from typing import Optional
-import pyttsx3
+
+# Optional imports - gracefully handle missing system packages during static analysis
+try:
+    import pygame
+except Exception:
+    pygame = None
+
+try:
+    import speech_recognition as sr
+except Exception:
+    sr = None
+
+try:
+    from gtts import gTTS
+except Exception:
+    gTTS = None
+
+try:
+    import pyttsx3
+except Exception:
+    pyttsx3 = None
 
 class VoiceEngine:
-    """Handles speech-to-text and thread-safe text-to-speech for Kali Linux."""
-    
+    """Handles speech-to-text and thread-safe text-to-speech for Kali Linux.
+
+    This implementation is defensive: heavy external libraries are optional at import time.
+    Runtime operations will check availability and report clear errors if missing.
+    """
+
     def __init__(self):
-        # 1. Configuration
-        self.recognizer = sr.Recognizer()
-        self.recognizer.energy_threshold = 150 
-        self.recognizer.dynamic_energy_threshold = False
-        self.recognizer.pause_threshold = 0.6
-        
-        # 2. Audio Mixer (Safe frequency for gTTS)
+        # Load optional runtime config (device index, thresholds)
+        config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'config.json')
+        cfg = None
         try:
-            if not pygame.mixer.get_init():
+            with open(config_path, 'r') as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = None
+
+        # Recognizer may be None if speech_recognition isn't installed
+        self.recognizer = sr.Recognizer() if sr else None
+        if self.recognizer:
+            # Allow config overrides, fallback to sensible defaults
+            mic_cfg = (cfg or {}).get('microphone', {})
+            self.recognizer.energy_threshold = mic_cfg.get('energy_threshold', 150)
+            self.recognizer.dynamic_energy_threshold = mic_cfg.get('dynamic_energy', False)
+            self.recognizer.pause_threshold = mic_cfg.get('pause_threshold', 0.6)
+
+        # Mixer init if pygame is available
+        try:
+            if pygame and not pygame.mixer.get_init():
                 pygame.mixer.pre_init(44100, -16, 2, 2048)
                 pygame.mixer.init()
         except Exception as e:
             print(f"Mixer Init Error: {e}")
 
-        # 3. Setup the Mic with the FIXED Sample Rate
-        # This is what made your test.py work!
-        self.mic = sr.Microphone(sample_rate=48000)
-        
-        # 4. Threading for TTS
+        # Microphone object (may be None). Respect config device_index if provided.
+        self.mic = None
+        if sr:
+            try:
+                mic_cfg = (cfg or {}).get('microphone', {})
+                device_index = mic_cfg.get('device_index', None)
+                sample_rate = mic_cfg.get('sample_rate', 48000)
+                if device_index is not None:
+                    self.mic = sr.Microphone(device_index=device_index, sample_rate=sample_rate)
+                else:
+                    self.mic = sr.Microphone(sample_rate=sample_rate)
+            except Exception as e:
+                print(f"Warning: could not open configured microphone: {e}")
+                try:
+                    self.mic = sr.Microphone(sample_rate=48000)
+                except Exception:
+                    self.mic = None
+
+        # TTS queue and control
         self.tts_queue = queue.Queue()
         self.stop_event = threading.Event()
         threading.Thread(target=self._process_tts_queue, daemon=True).start()
- 
+
     def listen_for_command(self):
         """Used when the UI is open to catch a specific command."""
+        if not self.recognizer or not self.mic:
+            print("SpeechRecognition not available on this host.")
+            return None
+
         try:
             with self.mic as source:
-                # We don't re-adjust noise here to keep the mic 'hot'
                 print("Listening for command...")
                 audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
                 return self.recognizer.recognize_google(audio).lower()
@@ -50,53 +100,73 @@ class VoiceEngine:
 
     def speak(self, text: str):
         """Adds text to the speech queue. Call this from any thread."""
-        if text and text.strip():
-            print(f"Queueing: {text}")
-            self.tts_queue.put(text)
-
-   
-
-# In __init__
-   
+        if not text or not text.strip():
+            return
+        print(f"Queueing: {text}")
+        self.tts_queue.put(text)
 
     def _process_tts_queue(self):
-        """Standard gTTS playback thread with error reporting."""
-        if not pygame.mixer.get_init():
-            pygame.mixer.init(44100)
-            
+        """gTTS playback thread. If gTTS/pygame missing, log and drain queue."""
         while True:
             try:
                 text = self.tts_queue.get()
-                if text is None: break
-                
-                print(f"Friday attempting to speak: {text}")
-                
-                # Create a unique filename to avoid 'File in use' errors
+                if text is None:
+                    break
+                # Prefer local pyttsx3 if available (no external network dependency)
+                if pyttsx3:
+                    try:
+                        engine = pyttsx3.init()
+                        engine.say(text)
+                        engine.runAndWait()
+                    except Exception as e:
+                        print(f"pyttsx3 TTS error: {e}")
+                    finally:
+                        self.tts_queue.task_done()
+                    continue
+
+                # Fallback to gTTS + pygame if available
+                if not gTTS or not pygame:
+                    print("TTS or audio backend not available. Would speak:", text)
+                    self.tts_queue.task_done()
+                    continue
+
                 filename = f"voice_{int(time.time() * 1000)}.mp3"
-                
-                tts = gTTS(text=text, lang='en')
-                tts.save(filename)
-                
-                pygame.mixer.music.load(filename)
-                pygame.mixer.music.play()
-                
-                while pygame.mixer.music.get_busy():
-                    if self.stop_event.is_set():
-                        pygame.mixer.music.stop()
-                        break
-                    time.sleep(0.1)
-                
-                pygame.mixer.music.unload() # Releases the file
-                
-                if os.path.exists(filename):
-                    os.remove(filename)
-                    
+                try:
+                    tts = gTTS(text=text, lang='en')
+                    tts.save(filename)
+                    pygame.mixer.music.load(filename)
+                    pygame.mixer.music.play()
+
+                    while pygame.mixer.music.get_busy():
+                        if self.stop_event.is_set():
+                            pygame.mixer.music.stop()
+                            break
+                        time.sleep(0.1)
+
+                    try:
+                        pygame.mixer.music.unload()
+                    except Exception:
+                        pass
+                finally:
+                    if os.path.exists(filename):
+                        try:
+                            os.remove(filename)
+                        except Exception:
+                            pass
+
             except Exception as e:
                 print(f"CRITICAL VOICE ERROR: {e}")
             finally:
-                self.tts_queue.task_done()
+                try:
+                    self.tts_queue.task_done()
+                except Exception:
+                    pass
 
     def listen(self):
+        if not self.recognizer or not self.mic:
+            print("SpeechRecognition not available on this host.")
+            return None
+
         with self.mic as source:
             self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
             try:
@@ -106,36 +176,32 @@ class VoiceEngine:
                 return text
             except Exception as e:
                 print(f"Mic error: {e}")
-                # FORCE a verbal response so you know it failed
                 self.speak("I'm sorry sir, I couldn't hear you.")
                 return None
 
     def listen_offline(self, timeout=3):
-        """
-        Wake Word Listener (High Speed).
-        Runs the system pocketsphinx directly to bypass Python 3.13 issues.
+        """Wake Word Listener via system pocketsphinx subprocess.
+
+        Returns the keyphrase string if detected, otherwise None.
         """
         try:
-            # We use '-time no' and '-logfn /dev/null' to keep it quiet and fast
+            import subprocess
             cmd = [
-                "pocketsphinx", "kws", 
-                "-keyphrase", "friday", 
+                "pocketsphinx", "kws",
+                "-keyphrase", "friday",
                 "-threshold", "1e-20",
                 "-adcdev", "default",
-                "-logfn", "/dev/null" 
+                "-logfn", "/dev/null",
             ]
-            
-            # Capture the output of the system-level engine
             process = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            
-            if "friday" in process.stdout.lower():
+            if "friday" in (process.stdout or "").lower():
                 return "friday"
             return None
         except Exception:
             return None
 
     def stop_speaking(self):
-        """Immediately terminates the current speech and clears pending queue."""
+        """Immediately terminates TTS playback and clears pending queue."""
         self.stop_event.set()
         while not self.tts_queue.empty():
             try:
@@ -145,36 +211,8 @@ class VoiceEngine:
                 break
 
     def set_voice_properties(self, rate: int = 150, volume: float = 0.9):
-        """Adjusts the mixer volume."""
-        # Note: gTTS rate cannot be changed mid-playback as it's a static MP3
-        pygame.mixer.music.set_volume(volume)
-
-
-    import subprocess
-
-    # def listen_offline(self, timeout=3):
-    #  """
-    #  Uses the system-level pocketsphinx to avoid Python 3.13 
-    #  compilation errors. Fast and reliable on Kali.
-    #   """
-    #  try:
-    #     # This command listens for 'friday' specifically
-    #     # -adcdev default tells it to use your PipeWire mic
-    #     cmd = [
-    #         "pocketsphinx", "kws", 
-    #         "-keyphrase", "friday", 
-    #         "-threshold", "1e-20",
-    #         "-time", "yes",
-    #         "-adcdev", "default"
-    #     ]
-        
-    #     # We run it as a subprocess with a timeout
-    #     process = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        
-    #     if "friday" in process.stdout.lower():
-    #         return "friday"
-    #  except subprocess.TimeoutExpired:
-    #     return None
-    #  except Exception as e:
-    #     # Silencing the ALSA noise in the console
-    #     return None
+        if pygame:
+            try:
+                pygame.mixer.music.set_volume(volume)
+            except Exception:
+                pass

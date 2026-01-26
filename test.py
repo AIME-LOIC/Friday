@@ -1,4 +1,9 @@
-import speech_recognition as sr
+try:
+    import speech_recognition as sr
+except ImportError:
+    print("Missing dependency: speech_recognition. Install dependencies with:\n  pip install -r requirements.txt")
+    raise
+
 
 r = sr.Recognizer()
 # Force a standard 48k sample rate to match Kali's PipeWire

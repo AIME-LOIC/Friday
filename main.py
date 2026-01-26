@@ -14,15 +14,23 @@ from lib.voice_engine import VoiceEngine
 from lib.command_processor import CommandProcessor
 import os
 import time
-import pygame
-# This hides the 'ALSA lib...' and 'JACK...' errors from the console
-import os
 import sys
 
-# Suppress ALSA/JACK error messages in the terminal
-os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
-f = open(os.devnull, 'w')
-sys.stderr = f
+# If you want to run without audio (CI/headless) set the env var:
+#   FRIDAY_HEADLESS=1  or FRIDAY_DISABLE_AUDIO_WARNINGS=1
+# This sets SDL to the dummy audio driver which prevents ALSA/JACK noise.
+_FRIDAY_HEADLESS = os.environ.get('FRIDAY_HEADLESS') == '1' or os.environ.get('FRIDAY_DISABLE_AUDIO_WARNINGS') == '1'
+if _FRIDAY_HEADLESS:
+    os.environ['SDL_AUDIODRIVER'] = 'dummy'
+
+# Hide pygame support prompt. If running headless, redirect stderr to reduce C-level ALSA/JACK noise.
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = 'hide'
+_stderr_null = None
+if _FRIDAY_HEADLESS:
+    _stderr_null = open(os.devnull, 'w')
+    sys.stderr = _stderr_null
+
+import pygame
 class VoiceAssistantGUI:
     """Main GUI application for the voice assistant."""
     
@@ -83,16 +91,6 @@ class VoiceAssistantGUI:
         self.root.attributes("-topmost", True) # Force to front
         self.voice_engine.speak("Yes? I am here.")
         self.start_listening()
-
-    def stop_listening(self):
-        """Modified: Stop listening and hide window."""
-        self.is_listening = False
-        self.is_hidden = True
-        self.listen_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
-        self.update_status("Sleeping...", '#7f8c8d')
-        self.root.withdraw() # Hide window
-    
     def setup_gui(self):
         """Set up the Tkinter GUI components."""
         
@@ -251,20 +249,55 @@ class VoiceAssistantGUI:
         # Bind the 'Enter' key to the send function for speed
         self.command_entry.bind('<Return>', lambda event: self.handle_text_command())
 
-# --- Add this method to your GUI Class ---
-    def handle_command(self, text):
-     if not text:
-        # This is where she should speak if you stay silent
-        self.voice_engine.speak("I didn't catch that, sir.") 
-        return
+    def handle_command(self, text: str):
+        """Handle a simple text command (fallback/example)."""
+        if not text:
+            self.voice_engine.speak("I didn't catch that, sir.")
+            return
 
-     print(f"Processing: {text}")
-    # Example command
-     if "hello" in text:
-        self.voice_engine.speak("Hello sir, how can I help you today?")
-     else:
-        # If the command isn't recognized, she MUST speak this:
-        self.voice_engine.speak("I understood the command, but I don't have a protocol for that yet.")
+        print(f"Processing: {text}")
+        if "hello" in text:
+            self.voice_engine.speak("Hello sir, how can I help you today?")
+        else:
+            self.voice_engine.speak("I understood the command, but I don't have a protocol for that yet.")
+
+    def handle_text_command(self, event=None):
+        """Called by the Send button or Enter key. Routes typed text to the command processor.
+
+        If the processor doesn't recognize the command, fall back to `handle_command`.
+        """
+        try:
+            text = self.command_entry.get().strip()
+        except Exception:
+            text = ''
+
+        # Clear the entry for convenience
+        try:
+            self.command_entry.delete(0, tk.END)
+        except Exception:
+            pass
+
+        if not text:
+            self.voice_engine.speak("Please type a command.")
+            return
+
+        self.log(f"Typed command: {text}")
+
+        handled = False
+        try:
+            if hasattr(self, 'command_processor') and self.command_processor:
+                handled = self.command_processor.process(text)
+        except Exception as e:
+            print(f"Error processing text command: {e}")
+            self.voice_engine.speak("There was an error processing that command.")
+
+        if not handled:
+            # Fallback: local/simple handler
+            try:
+                self.handle_command(text)
+            except Exception as e:
+                print(f"Fallback handler error: {e}")
+                self.voice_engine.speak("I couldn't handle that command.")
     
     def log(self, message: str):
         """Add a message to the activity log."""
@@ -322,42 +355,49 @@ class VoiceAssistantGUI:
         self.log("Voice listening stopped")
     
     def listen_loop(self):
-     print("Friday is standing by...")
-     while True:
-        try:
-            # SAFETY CHECK: Only check busy if mixer is actually running
-            if pygame.mixer.get_init():
-                if pygame.mixer.music.get_busy():
-                    time.sleep(0.5)
-                    continue
-            else:
-                # Try to re-init if it died
-                pygame.mixer.init()
-                continue
-            
-            # ... rest of your listening logic ...
-        except Exception as e:
-            print(f"Loop error: {e}")
-            time.sleep(1)
+        print("Friday is standing by...")
+        while True:
+            try:
+                # SAFETY CHECK: Only check busy if mixer is actually running
+                if pygame and getattr(pygame, 'mixer', None):
+                    if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                        time.sleep(0.5)
+                        continue
+                else:
+                    # Try to re-init if it died (best-effort)
+                    try:
+                        if pygame:
+                            pygame.mixer.init()
+                    except Exception:
+                        pass
+
+                # ... rest of your listening logic ...
+            except Exception as e:
+                print(f"Loop error: {e}")
+                time.sleep(1)
     def start_friday(self):
-    # 1. Start the permanent background listener
-    # This keeps the mic stream OPEN and STABLE
-     self.voice_engine.recognizer.listen_in_background(
-        self.voice_engine.mic, 
-        self.background_callback
-    )
-    print("Mic stream stabilized.")
+        # 1. Start the permanent background listener
+        # This keeps the mic stream OPEN and STABLE
+        if hasattr(self.voice_engine, 'recognizer') and self.voice_engine.recognizer:
+            try:
+                self.voice_engine.recognizer.listen_in_background(
+                    self.voice_engine.mic,
+                    self.background_callback
+                )
+                print("Mic stream stabilized.")
+            except Exception as e:
+                print(f"Could not start background listener: {e}")
 
     def background_callback(self, recognizer, audio):
-     """This runs every time the mic hears sound without closing the stream."""
-     try:
-        if self.is_hidden:
-            # Fast check for wake word
-            text = recognizer.recognize_google(audio).lower()
-            if "friday" in text:
-                self.root.after(0, self.show_interface)
-     except:
-        pass
+        """This runs every time the mic hears sound without closing the stream."""
+        try:
+            if self.is_hidden:
+                # Fast check for wake word
+                text = recognizer.recognize_google(audio).lower()
+                if "friday" in text:
+                    self.root.after(0, self.show_interface)
+        except Exception:
+            pass
     
     def show_help(self):
         """Show help information."""

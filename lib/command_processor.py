@@ -283,75 +283,60 @@ class CommandProcessor:
         self.voice_engine.stop_speaking()
     
 
-    import wikipedia # <--- Add this at the top
-
-# Inside your CommandProcessor class:
-
-    def handle_tell_command(self, command: str):
-     """Handle 'tell me about' or 'what is'."""
-    # Strip away the trigger words to get the pure topic
-     topic = command.replace('tell me about', '').replace('tell me', '').replace('what is', '').strip()
-    
-     if topic:
-        self.perform_research(topic)
-     else:
-        self.voice_engine.speak("What would you like to know about?")
+    # Wikipedia is used by perform_research; import if available
+    try:
+        import wikipedia
+    except Exception:
+        wikipedia = None
 
     def perform_research(self, topic: str):
-     """Fetches a summary and speaks it back as feedback."""
-     print(f"Researching: {topic}...")
-     self.voice_engine.speak(f"Looking up {topic} for you.")
-     
-     try:
-         # Get a 2-sentence summary from Wikipedia
-        summary = wikipedia.summary(topic, sentences=2)
-        print(f"Feedback: {summary}")
-        self.voice_engine.speak(summary)
-        
-     except wikipedia.exceptions.DisambiguationError as e:
-        # This happens if a word has many meanings (e.g. "Python" could be the snake or the language)
-        self.voice_engine.speak(f"There are several meanings for {topic}. Could you be more specific?")
-     except wikipedia.exceptions.PageError:
-        self.voice_engine.speak(f"I'm sorry, I couldn't find a page for {topic}.")
-     except Exception:
-        self.voice_engine.speak("I had trouble connecting to the internet to find that.")
+        """Fetch a short summary about a topic using Wikipedia when available."""
+        if not topic:
+            self.voice_engine.speak("What would you like to know about?")
+            return
+
+        self.voice_engine.speak(f"Looking up {topic} for you.")
+        if wikipedia:
+            try:
+                summary = wikipedia.summary(topic, sentences=2)
+                print(f"Feedback: {summary}")
+                self.voice_engine.speak(summary)
+            except wikipedia.exceptions.DisambiguationError:
+                self.voice_engine.speak("There are several meanings for that topic. Could you be more specific?")
+            except wikipedia.exceptions.PageError:
+                self.voice_engine.speak("I'm sorry, I couldn't find a page for that topic.")
+            except Exception:
+                self.voice_engine.speak("I had trouble connecting to the internet to find that.")
+        else:
+            self.voice_engine.speak("Wikipedia is not available in this environment.")
+
     import random
 
     def start_game(self, command: str):
-     self.voice_engine.speak("I have two games: Guess the Number or Rock Paper Scissors. Which one do you want?")
+        self.voice_engine.speak("I have two games: Guess the Number or Rock Paper Scissors. Which one do you want?")
 
     def play_guess(self, command: str):
-     """Simple number guessing game."""
-     target = random.randint(1, 10)
-     self.voice_engine.speak("I am thinking of a number between 1 and 10. Can you guess it?")
-    # Logic to capture the next input would go here
-    
-    def _initialize_commands(self) -> Dict[str, Callable]:
-        """Initialize command mappings."""
-        return {
-            # ... keep your existing lines ...
-            'rock paper scissors': self.play_rps, # Ensure this matches the function name below
-            'shut up': self.silence_assistant,
-            'stop': self.silence_assistant,
-        }
+        """Simple number guessing game (starter only)."""
+        target = random.randint(1, 10)
+        self.voice_engine.speak("I am thinking of a number between 1 and 10. Can you guess it?")
 
     def play_rps(self, command: str):
-        """Rock Paper Scissors Game Logic."""
-        import random
+        """Rock Paper Scissors game logic."""
         options = ["rock", "paper", "scissors"]
         bot_choice = random.choice(options)
-        
-        # Check which one the user said/typed
+
         user_choice = None
-        if "rock" in command: user_choice = "rock"
-        elif "paper" in command: user_choice = "paper"
-        elif "scissors" in command: user_choice = "scissors"
-        
+        if "rock" in command:
+            user_choice = "rock"
+        elif "paper" in command:
+            user_choice = "paper"
+        elif "scissors" in command:
+            user_choice = "scissors"
+
         if not user_choice:
             self.voice_engine.speak("Please choose rock, paper, or scissors to play!")
             return
 
-        # Winning Logic
         if user_choice == bot_choice:
             result = f"It's a tie! I also chose {bot_choice}."
         elif (user_choice == "rock" and bot_choice == "scissors") or \
@@ -360,10 +345,10 @@ class CommandProcessor:
             result = f"You win! I chose {bot_choice}."
         else:
             result = f"I win! I chose {bot_choice}."
-        
+
         print(f"RPS Result: {result}")
         self.voice_engine.speak(result)
 
     def silence_assistant(self, command: str):
-        """Kills the voice engine output immediately."""
+        """Stops any active TTS playback."""
         self.voice_engine.stop_speaking()
