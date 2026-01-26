@@ -2,6 +2,7 @@ import os
 import time
 import json
 import threading
+import tempfile
 import queue
 from typing import Optional
 
@@ -35,7 +36,8 @@ class VoiceEngine:
 
     def __init__(self):
         # Load optional runtime config (device index, thresholds)
-        config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'config.json')
+        # config.json lives at the repository root (one level up from lib)
+        config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'config.json'))
         cfg = None
         try:
             with open(config_path, 'r') as f:
@@ -48,13 +50,21 @@ class VoiceEngine:
         if self.recognizer:
             # Allow config overrides, fallback to sensible defaults
             mic_cfg = (cfg or {}).get('microphone', {})
-            self.recognizer.energy_threshold = mic_cfg.get('energy_threshold', 150)
+            # Guard against an accidentally huge threshold from config (makes speech detection fail)
+            cfg_et = mic_cfg.get('energy_threshold', 150)
+            try:
+                if isinstance(cfg_et, (int, float)) and cfg_et > 2000:
+                    print(f"Configured energy_threshold={cfg_et} is very high; capping to 300 for reliability.")
+                    cfg_et = 300
+            except Exception:
+                cfg_et = 150
+            self.recognizer.energy_threshold = cfg_et
             # Enable dynamic energy by default to adapt to ambient noise quickly
             self.recognizer.dynamic_energy_threshold = mic_cfg.get('dynamic_energy', True)
             # Lower pause_threshold for snappier detection of short phrases
             self.recognizer.pause_threshold = mic_cfg.get('pause_threshold', 0.45)
 
-        # Mixer init if pygame is available
+        # Mixer init if pygame is available - prefer 44100 Hz for gTTS/mp3 playback
         try:
             if pygame and not pygame.mixer.get_init():
                 pygame.mixer.pre_init(44100, -16, 2, 2048)
@@ -84,11 +94,18 @@ class VoiceEngine:
         self.tts_queue = queue.Queue()
         self.stop_event = threading.Event()
 
+        # Speech recognition runtime settings (defaults can be overridden by config.json)
+        sr_cfg = (cfg or {}).get('speech_recognition', {})
+        self.sr_timeout = int(sr_cfg.get('timeout', 10))
+        self.sr_phrase_limit = int(sr_cfg.get('phrase_limit', 15))
+
         # TTS runtime prefs (can be overridden in config.json under 'assistant')
         assistant_cfg = (cfg or {}).get('assistant', {})
         # Use a slightly slower and softer default to sound less robotic.
         self.tts_rate = assistant_cfg.get('voice_speed', 120)
         self.tts_volume = assistant_cfg.get('voice_volume', 0.85)
+        # prefer online (gTTS) when configured and installed
+        self.prefer_online_tts = bool(assistant_cfg.get('prefer_online_tts', False))
         self.preferred_voice = None
         # We do not create a long-lived pyttsx3 engine on the main thread; instead
         # we'll initialize and reuse it inside the TTS thread to avoid cross-thread
@@ -141,6 +158,14 @@ class VoiceEngine:
 
         threading.Thread(target=self._process_tts_queue, daemon=True).start()
 
+        # After TTS thread is started, attempt to discover and set the best
+        # available female voice (this will also update a running pyttsx3
+        # engine if one is created).
+        try:
+            self.discover_and_set_female_voice()
+        except Exception:
+            pass
+
     def listen_for_command(self):
         """Used when the UI is open to catch a specific command."""
         if not self.recognizer or not self.mic:
@@ -150,10 +175,32 @@ class VoiceEngine:
         try:
             with self.mic as source:
                 print("Listening for command...")
-                # Use shorter timeout and phrase_time_limit for snappier responses
-                audio = self.recognizer.listen(source, timeout=3, phrase_time_limit=4)
-                return self.recognizer.recognize_google(audio).lower()
-        except Exception:
+                # Calibrate to ambient noise to improve detection
+                try:
+                    self.recognizer.adjust_for_ambient_noise(source, duration=1.0)
+                except Exception:
+                    pass
+                # Use configured timeouts so short pauses don't abort
+                try:
+                    audio = self.recognizer.listen(source, timeout=self.sr_timeout, phrase_time_limit=self.sr_phrase_limit)
+                except sr.WaitTimeoutError:
+                    self.speak("I didn't hear anything. Please try again.")
+                    return None
+                try:
+                    return self.recognizer.recognize_google(audio).lower()
+                except sr.UnknownValueError:
+                    self.speak("Sorry, I couldn't understand you. Please repeat.")
+                    return None
+                except sr.RequestError:
+                    self.speak("Speech recognition service is unavailable. Check your internet connection.")
+                    return None
+        except Exception as e:
+            try:
+                print('listen_for_command exception:', type(e), repr(e))
+                import traceback
+                traceback.print_exc()
+            except Exception:
+                print('listen_for_command exception: (could not repr)')
             self.speak("I can't hear you, sir.")
             return None
 
@@ -168,23 +215,149 @@ class VoiceEngine:
         """gTTS playback thread. If gTTS/pygame missing, log and drain queue."""
         # lazy-init engine inside the TTS thread to avoid cross-thread issues
         pyttsx3_engine = None
+        # simple on-disk cache for generated gTTS mp3s to avoid re-generating
+        cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'voice_cache')
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            cache_dir = None
+        # If local pyttsx3 is available, initialize it immediately inside the thread
+        if pyttsx3:
+            try:
+                pyttsx3_engine = pyttsx3.init()
+                try:
+                    if self.preferred_voice:
+                        pyttsx3_engine.setProperty('voice', self.preferred_voice)
+                except Exception:
+                    pass
+                try:
+                    pyttsx3_engine.setProperty('rate', int(self.tts_rate))
+                except Exception:
+                    pass
+                try:
+                    pyttsx3_engine.setProperty('volume', float(self.tts_volume))
+                except Exception:
+                    pass
+                try:
+                    self._pyttsx3_engine = pyttsx3_engine
+                except Exception:
+                    pass
+            except Exception:
+                pyttsx3_engine = None
         while True:
             try:
                 text = self.tts_queue.get()
                 if text is None:
                     break
+                # If configured to prefer online TTS and gTTS+pygame are available, use that first
+                if self.prefer_online_tts and gTTS and pygame:
+                    try:
+                        # ensure mixer is initialized with correct sample rate
+                        try:
+                            if not pygame.mixer.get_init():
+                                pygame.mixer.pre_init(44100, -16, 2, 2048)
+                                pygame.mixer.init()
+                        except Exception:
+                            pass
+
+                        filename = None
+                        try:
+                            # use cache if available to avoid repeated gTTS calls
+                            fn = None
+                            if cache_dir:
+                                try:
+                                    import hashlib
+                                    h = hashlib.sha1(text.encode('utf-8')).hexdigest()
+                                    fn = os.path.join(cache_dir, f"{h}.mp3")
+                                    if os.path.exists(fn):
+                                        filename = fn
+                                except Exception:
+                                    fn = None
+                            if not filename:
+                                # create temp mp3 file
+                                fd, tmpfn = tempfile.mkstemp(prefix='voice_', suffix='.mp3')
+                                os.close(fd)
+                                filename = tmpfn
+                                tts = gTTS(text=text, lang='en', tld='co.uk')
+                                tts.save(filename)
+                                # save to cache if possible
+                                try:
+                                    if fn:
+                                        import shutil
+                                        shutil.copyfile(filename, fn)
+                                except Exception:
+                                    pass
+                            try:
+                                # Prefer system PulseAudio/PipeWire player if available
+                                from shutil import which
+                                paplay = which('paplay') or which('pw-play')
+                                if paplay:
+                                    try:
+                                        import subprocess
+                                        subprocess.run([paplay, filename], check=False)
+                                    except Exception as e:
+                                        print('paplay/pw-play failed, falling back to pygame:', e)
+                                        pygame.mixer.music.load(filename)
+                                        pygame.mixer.music.set_volume(float(self.tts_volume))
+                                        pygame.mixer.music.play()
+                                        while pygame.mixer.music.get_busy():
+                                            if self.stop_event.is_set():
+                                                try:
+                                                    pygame.mixer.music.stop()
+                                                except Exception:
+                                                    pass
+                                                break
+                                            time.sleep(0.1)
+                                        try:
+                                            pygame.mixer.music.unload()
+                                        except Exception:
+                                            pass
+                                else:
+                                    pygame.mixer.music.load(filename)
+                                    pygame.mixer.music.set_volume(float(self.tts_volume))
+                                    pygame.mixer.music.play()
+                                    while pygame.mixer.music.get_busy():
+                                        if self.stop_event.is_set():
+                                            try:
+                                                pygame.mixer.music.stop()
+                                            except Exception:
+                                                pass
+                                            break
+                                        time.sleep(0.1)
+                                    try:
+                                        pygame.mixer.music.unload()
+                                    except Exception:
+                                        pass
+                            except Exception as e:
+                                print('pygame playback error for gTTS:', e)
+                        finally:
+                            # if we created a temp file that's not the cached file, remove it
+                            try:
+                                if filename and cache_dir and not filename.startswith(cache_dir):
+                                    if os.path.exists(filename):
+                                        os.remove(filename)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        print('gTTS TTS error:', e)
+                    finally:
+                        try:
+                            self.tts_queue.task_done()
+                        except Exception:
+                            pass
+                    continue
+
                 # Prefer local pyttsx3 if available (no external network dependency)
                 if pyttsx3:
                     try:
                         # initialize engine once per thread
+                        # engine was already initialized at thread start if possible
                         if pyttsx3_engine is None:
                             pyttsx3_engine = pyttsx3.init()
-                            # expose engine on self so runtime setters can modify it
                             try:
                                 self._pyttsx3_engine = pyttsx3_engine
                             except Exception:
                                 pass
-                            # Apply preferred voice/rate/volume if configured
                             try:
                                 if self.preferred_voice:
                                     pyttsx3_engine.setProperty('voice', self.preferred_voice)
@@ -215,35 +388,60 @@ class VoiceEngine:
                         self.tts_queue.task_done()
                     continue
 
-                # Fallback to gTTS + pygame if available
-                if not gTTS or not pygame:
-                    print("TTS or audio backend not available. Would speak:", text)
-                    self.tts_queue.task_done()
-                    continue
-
-                filename = f"voice_{int(time.time() * 1000)}.mp3"
-                try:
-                    tts = gTTS(text=text, lang='en')
-                    tts.save(filename)
-                    pygame.mixer.music.load(filename)
-                    pygame.mixer.music.play()
-
-                    while pygame.mixer.music.get_busy():
-                        if self.stop_event.is_set():
-                            pygame.mixer.music.stop()
-                            break
-                        time.sleep(0.1)
-
+                # Fallback to gTTS + pygame if available and online preference not set
+                if gTTS and pygame:
                     try:
-                        pygame.mixer.music.unload()
-                    except Exception:
-                        pass
-                finally:
-                    if os.path.exists(filename):
                         try:
-                            os.remove(filename)
+                            if not pygame.mixer.get_init():
+                                pygame.mixer.pre_init(44100, -16, 2, 2048)
+                                pygame.mixer.init()
                         except Exception:
                             pass
+                        filename = None
+                        try:
+                            fd, filename = tempfile.mkstemp(prefix='voice_', suffix='.mp3')
+                            os.close(fd)
+                            tts = gTTS(text=text, lang='en', tld='co.uk')
+                            tts.save(filename)
+                            try:
+                                pygame.mixer.music.load(filename)
+                                pygame.mixer.music.set_volume(float(self.tts_volume))
+                                pygame.mixer.music.play()
+                                while pygame.mixer.music.get_busy():
+                                    if self.stop_event.is_set():
+                                        try:
+                                            pygame.mixer.music.stop()
+                                        except Exception:
+                                            pass
+                                        break
+                                    time.sleep(0.1)
+                                try:
+                                    pygame.mixer.music.unload()
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                print('pygame playback error for gTTS fallback:', e)
+                        finally:
+                            if filename and os.path.exists(filename):
+                                try:
+                                    os.remove(filename)
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        print('gTTS fallback error:', e)
+                    finally:
+                        try:
+                            self.tts_queue.task_done()
+                        except Exception:
+                            pass
+                    continue
+
+                # If no TTS backend available, just log
+                print('TTS or audio backend not available. Would speak:', text)
+                try:
+                    self.tts_queue.task_done()
+                except Exception:
+                    pass
 
             except Exception as e:
                 print(f"CRITICAL VOICE ERROR: {e}")
@@ -259,10 +457,14 @@ class VoiceEngine:
             return None
 
         with self.mic as source:
-            self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            # calibrate to ambient noise
+            try:
+                self.recognizer.adjust_for_ambient_noise(source, duration=1.0)
+            except Exception:
+                pass
             try:
                 print("Waiting for your voice...")
-                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
+                audio = self.recognizer.listen(source, timeout=self.sr_timeout, phrase_time_limit=self.sr_phrase_limit)
                 text = self.recognizer.recognize_google(audio).lower()
                 return text
             except Exception as e:
@@ -332,3 +534,75 @@ class VoiceEngine:
                 pygame.mixer.music.set_volume(float(volume))
             except Exception:
                 pass
+
+    def discover_and_set_female_voice(self):
+        """Scan available pyttsx3 voices and pick the best female-sounding voice.
+
+        Preference order:
+        1. Voice with 'natalie' in id/name.
+        2. Any voice that matches common female keywords.
+        3. Any English voice.
+        4. Fallback to espeak female variants when no suitable voice found.
+        """
+        if not pyttsx3:
+            return None
+
+        try:
+            probe = pyttsx3.init()
+            voices = probe.getProperty('voices') or []
+            female_keywords = ('natalie', 'female', 'zira', 'susan', 'kate', 'victoria', 'anna', 'amy')
+            eng_keywords = ('en_us', 'en-us', 'english', 'en_gb', 'en-gb', 'en')
+
+            chosen = None
+            # 1) natalie
+            for v in voices:
+                combined = ((getattr(v, 'id', '') or '') + ' ' + (getattr(v, 'name', '') or '')).lower()
+                if 'natalie' in combined:
+                    chosen = v.id
+                    break
+
+            # 2) female keywords
+            if not chosen:
+                for v in voices:
+                    combined = ((getattr(v, 'id', '') or '') + ' ' + (getattr(v, 'name', '') or '')).lower()
+                    if any(k in combined for k in female_keywords):
+                        chosen = v.id
+                        break
+
+            # 3) english voices
+            if not chosen:
+                for v in voices:
+                    combined = ((getattr(v, 'id', '') or '') + ' ' + (getattr(v, 'name', '') or '')).lower()
+                    if any(k in combined for k in eng_keywords):
+                        chosen = v.id
+                        break
+
+            # apply selection
+            if chosen:
+                self.preferred_voice = chosen
+                # if engine exists, set it immediately
+                eng = getattr(self, '_pyttsx3_engine', None)
+                if eng is not None:
+                    try:
+                        eng.setProperty('voice', self.preferred_voice)
+                    except Exception:
+                        pass
+            else:
+                # 4) fallback to espeak female variants by setting the property when engine exists
+                eng = getattr(self, '_pyttsx3_engine', None)
+                if eng is not None:
+                    try:
+                        eng.setProperty('voice', 'en+f3')
+                    except Exception:
+                        try:
+                            eng.setProperty('voice', 'en+f2')
+                        except Exception:
+                            pass
+
+            try:
+                probe.stop()
+            except Exception:
+                pass
+            return self.preferred_voice
+        except Exception:
+            return None
