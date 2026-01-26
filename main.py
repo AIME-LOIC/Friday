@@ -356,25 +356,67 @@ class VoiceAssistantGUI:
     
     def listen_loop(self):
         print("Friday is standing by...")
-        while True:
+        # Loop while the GUI believes we're listening
+        while self.is_listening:
             try:
-                # SAFETY CHECK: Only check busy if mixer is actually running
+                # SAFETY CHECK: don't listen while TTS playback is busy
                 if pygame and getattr(pygame, 'mixer', None):
-                    if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
-                        time.sleep(0.5)
-                        continue
-                else:
-                    # Try to re-init if it died (best-effort)
                     try:
-                        if pygame:
-                            pygame.mixer.init()
+                        if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                            time.sleep(0.2)
+                            continue
                     except Exception:
                         pass
 
-                # ... rest of your listening logic ...
+                # Prefer the lightweight listen_for_command helper
+                text = None
+                try:
+                    if hasattr(self.voice_engine, 'listen_for_command'):
+                        text = self.voice_engine.listen_for_command()
+                    elif hasattr(self.voice_engine, 'listen'):
+                        text = self.voice_engine.listen()
+                except Exception as e:
+                    print(f"Listen error: {e}")
+                    text = None
+
+                if text:
+                    text = text.strip()
+                    self.log(f"Heard: {text}")
+                    # Route to the command processor first
+                    handled = False
+                    try:
+                        if hasattr(self, 'command_processor') and self.command_processor:
+                            handled = self.command_processor.process(text)
+                    except Exception as e:
+                        print(f"Processing error: {e}")
+                        try:
+                            self.voice_engine.speak("There was an error processing your command.")
+                        except Exception:
+                            pass
+
+                    if not handled:
+                        # Fallback local handler
+                        try:
+                            self.handle_command(text)
+                        except Exception as e:
+                            print(f"Fallback handler error: {e}")
+
+                # small sleep to avoid busy loop
+                time.sleep(0.1)
+
             except Exception as e:
                 print(f"Loop error: {e}")
-                time.sleep(1)
+                time.sleep(0.5)
+
+        # Reset UI state when loop exits
+        try:
+            self.is_listening = False
+            self.listen_button.config(state=tk.NORMAL)
+            self.stop_button.config(state=tk.DISABLED)
+            self.update_status("Stopped", '#e74c3c')
+            self.log("Voice listening stopped")
+        except Exception:
+            pass
     def start_friday(self):
         # 1. Start the permanent background listener
         # This keeps the mic stream OPEN and STABLE

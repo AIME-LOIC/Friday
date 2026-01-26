@@ -49,8 +49,10 @@ class VoiceEngine:
             # Allow config overrides, fallback to sensible defaults
             mic_cfg = (cfg or {}).get('microphone', {})
             self.recognizer.energy_threshold = mic_cfg.get('energy_threshold', 150)
-            self.recognizer.dynamic_energy_threshold = mic_cfg.get('dynamic_energy', False)
-            self.recognizer.pause_threshold = mic_cfg.get('pause_threshold', 0.6)
+            # Enable dynamic energy by default to adapt to ambient noise quickly
+            self.recognizer.dynamic_energy_threshold = mic_cfg.get('dynamic_energy', True)
+            # Lower pause_threshold for snappier detection of short phrases
+            self.recognizer.pause_threshold = mic_cfg.get('pause_threshold', 0.45)
 
         # Mixer init if pygame is available
         try:
@@ -81,6 +83,62 @@ class VoiceEngine:
         # TTS queue and control
         self.tts_queue = queue.Queue()
         self.stop_event = threading.Event()
+
+        # TTS runtime prefs (can be overridden in config.json under 'assistant')
+        assistant_cfg = (cfg or {}).get('assistant', {})
+        # Use a slightly slower and softer default to sound less robotic.
+        self.tts_rate = assistant_cfg.get('voice_speed', 120)
+        self.tts_volume = assistant_cfg.get('voice_volume', 0.85)
+        self.preferred_voice = None
+        # We do not create a long-lived pyttsx3 engine on the main thread; instead
+        # we'll initialize and reuse it inside the TTS thread to avoid cross-thread
+        # issues. Here we only inspect available voices (best-effort) to pick a
+        # likely female/English voice id.
+        if pyttsx3:
+            try:
+                _probe = pyttsx3.init()
+                _voices = _probe.getProperty('voices') or []
+                # scoring heuristic: prefer voices that mention 'natalie' first (explicit user request),
+                # then female indicators or common names
+                # add 'natalie' here to allow explicit selection when available on the host
+                female_keywords = ('female', 'natalie', 'zira', 'susan', 'kate', 'victoria', 'anna', 'alloy', 'amy')
+                eng_keywords = ('en_us', 'en-us', 'english', 'en_gb', 'en-gb', 'en')
+                chosen = None
+                # Prefer an explicit 'natalie' voice if present
+                for v in _voices:
+                    combined = ((getattr(v, 'id', '') or '') + ' ' + (getattr(v, 'name', '') or '')).lower()
+                    if 'natalie' in combined:
+                        chosen = v.id
+                        break
+                # Then prefer other female indicators
+                if not chosen:
+                    for v in _voices:
+                        vid = (getattr(v, 'id', '') or '').lower()
+                        vname = (getattr(v, 'name', '') or '').lower()
+                        combined = vid + ' ' + vname
+                        if any(k in combined for k in female_keywords):
+                            chosen = v.id
+                            break
+                if not chosen:
+                    # prefer english voices next
+                    for v in _voices:
+                        vid = (getattr(v, 'id', '') or '').lower()
+                        vname = (getattr(v, 'name', '') or '').lower()
+                        combined = vid + ' ' + vname
+                        if any(k in combined for k in eng_keywords):
+                            chosen = v.id
+                            break
+                # fallback to first available voice
+                if not chosen and _voices:
+                    chosen = _voices[0].id
+                self.preferred_voice = chosen
+                try:
+                    _probe.stop()
+                except Exception:
+                    pass
+            except Exception:
+                self.preferred_voice = None
+
         threading.Thread(target=self._process_tts_queue, daemon=True).start()
 
     def listen_for_command(self):
@@ -92,7 +150,8 @@ class VoiceEngine:
         try:
             with self.mic as source:
                 print("Listening for command...")
-                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
+                # Use shorter timeout and phrase_time_limit for snappier responses
+                audio = self.recognizer.listen(source, timeout=3, phrase_time_limit=4)
                 return self.recognizer.recognize_google(audio).lower()
         except Exception:
             self.speak("I can't hear you, sir.")
@@ -107,6 +166,8 @@ class VoiceEngine:
 
     def _process_tts_queue(self):
         """gTTS playback thread. If gTTS/pygame missing, log and drain queue."""
+        # lazy-init engine inside the TTS thread to avoid cross-thread issues
+        pyttsx3_engine = None
         while True:
             try:
                 text = self.tts_queue.get()
@@ -115,9 +176,39 @@ class VoiceEngine:
                 # Prefer local pyttsx3 if available (no external network dependency)
                 if pyttsx3:
                     try:
-                        engine = pyttsx3.init()
-                        engine.say(text)
-                        engine.runAndWait()
+                        # initialize engine once per thread
+                        if pyttsx3_engine is None:
+                            pyttsx3_engine = pyttsx3.init()
+                            # expose engine on self so runtime setters can modify it
+                            try:
+                                self._pyttsx3_engine = pyttsx3_engine
+                            except Exception:
+                                pass
+                            # Apply preferred voice/rate/volume if configured
+                            try:
+                                if self.preferred_voice:
+                                    pyttsx3_engine.setProperty('voice', self.preferred_voice)
+                            except Exception:
+                                pass
+                            try:
+                                pyttsx3_engine.setProperty('rate', int(self.tts_rate))
+                            except Exception:
+                                pass
+                            try:
+                                pyttsx3_engine.setProperty('volume', float(self.tts_volume))
+                            except Exception:
+                                pass
+
+                        # Speak the phrase. Respect stop_event by stopping the engine if triggered.
+                        pyttsx3_engine.say(text)
+                        pyttsx3_engine.runAndWait()
+                        # reset stop_event after successful utterance
+                        if self.stop_event.is_set():
+                            try:
+                                pyttsx3_engine.stop()
+                            except Exception:
+                                pass
+                            self.stop_event.clear()
                     except Exception as e:
                         print(f"pyttsx3 TTS error: {e}")
                     finally:
@@ -211,8 +302,33 @@ class VoiceEngine:
                 break
 
     def set_voice_properties(self, rate: int = 150, volume: float = 0.9):
+        # Update runtime preferences used by pyttsx3 and pygame
+        try:
+            self.tts_rate = int(rate)
+        except Exception:
+            pass
+        try:
+            self.tts_volume = float(volume)
+        except Exception:
+            pass
+
+        # If a running pyttsx3 engine exists, update it immediately.
+        try:
+            eng = getattr(self, '_pyttsx3_engine', None)
+            if eng is not None:
+                try:
+                    eng.setProperty('rate', int(self.tts_rate))
+                except Exception:
+                    pass
+                try:
+                    eng.setProperty('volume', float(self.tts_volume))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         if pygame:
             try:
-                pygame.mixer.music.set_volume(volume)
+                pygame.mixer.music.set_volume(float(volume))
             except Exception:
                 pass
