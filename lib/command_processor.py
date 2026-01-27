@@ -6,7 +6,12 @@ import webbrowser
 import subprocess
 import datetime
 import os
-import pywhatkit
+# Instead of just 'import pywhatkit', use this:
+try:
+    import pywhatkit
+except Exception as e:
+    print(f"Warning: pywhatkit failed to load (Internet issue). Some features will be disabled. Error: {e}")
+    pywhatkit = None
 from click import command
 from click import command
 import pyautogui
@@ -267,15 +272,23 @@ class CommandProcessor:
 
     def play_on_youtube(self, command: str):
      """Search for a song/video and play it on YouTube."""
-     # Removes "play" or "search on youtube" from the string
+    # Clean the command string
      query = command.replace('play', '').replace('youtube', '').replace('search', '').strip()
+    
      if query:
-        self.voice_engine.speak(f"Playing {query} on YouTube")
-        url = f"https://www.youtube.com/results?search_query={query}"
-        webbrowser.open(url)
-        # Note: To auto-play the first result, specialized libraries like 'pywhatkit' are needed, 
-        pywhatkit.playonyt(query)
-        # but a browser search is the most stable on Kali Linux.
+        self.voice_engine.speak(f"Playing {query} on YouTube, sir.")
+        
+        # 1. Primary Method: Try pywhatkit for auto-play
+        try:
+            import pywhatkit
+            # Note: pywhatkit can sometimes hang if the internet is slow
+            pywhatkit.playonyt(query)
+        except Exception as e:
+            print(f"Pywhatkit error: {e}")
+            # 2. Fallback Method: Standard browser search (Super stable on Kali)
+            import webbrowser
+            url = f"https://www.youtube.com/results?search_query={query}"
+            webbrowser.open(url)
      else:
         self.voice_engine.speak("What would you like me to play?")
     def silence_assistant(self, command: str):

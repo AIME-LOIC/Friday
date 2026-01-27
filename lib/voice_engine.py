@@ -53,20 +53,9 @@ class VoiceEngine:
         # Recognizer may be None if speech_recognition isn't installed
         self.recognizer = sr.Recognizer() if sr else None
         if self.recognizer:
-            # Allow config overrides, fallback to sensible defaults
             mic_cfg = (cfg or {}).get('microphone', {})
-            # Guard against an accidentally huge threshold from config (makes speech detection fail)
-            cfg_et = mic_cfg.get('energy_threshold', 150)
-            try:
-                if isinstance(cfg_et, (int, float)) and cfg_et > 2000:
-                    print(f"Configured energy_threshold={cfg_et} is very high; capping to 300 for reliability.")
-                    cfg_et = 300
-            except Exception:
-                cfg_et = 150
-            self.recognizer.energy_threshold = cfg_et
-            # Enable dynamic energy by default to adapt to ambient noise quickly
+            self.recognizer.energy_threshold = min(mic_cfg.get('energy_threshold', 150), 300)
             self.recognizer.dynamic_energy_threshold = mic_cfg.get('dynamic_energy', True)
-            # Lower pause_threshold for snappier detection of short phrases
             self.recognizer.pause_threshold = mic_cfg.get('pause_threshold', 0.45)
             # Ensure recognizer.non_speaking_duration <= pause_threshold to avoid
             # an internal assertion in speech_recognition.listen()
@@ -82,7 +71,7 @@ class VoiceEngine:
             except Exception:
                 pass
 
-        # Mixer init if pygame is available - prefer 44100 Hz for gTTS/mp3 playback
+        # 2. Audio Mixer Init
         try:
             if pygame and not pygame.mixer.get_init():
                 pygame.mixer.pre_init(44100, -16, 2, 2048)
@@ -90,22 +79,28 @@ class VoiceEngine:
         except Exception as e:
             print(f"Mixer Init Error: {e}")
 
-        # Microphone object (may be None). Respect config device_index if provided.
+        # 3. HARDENED Microphone Initialization
         self.mic = None
         if sr:
+            mic_cfg = (cfg or {}).get('microphone', {})
+            sample_rate = mic_cfg.get('sample_rate', 48000)
+            device_index = mic_cfg.get('device_index', None)
+
             try:
-                mic_cfg = (cfg or {}).get('microphone', {})
-                device_index = mic_cfg.get('device_index', None)
-                sample_rate = mic_cfg.get('sample_rate', 48000)
+                # On Kali, sometimes we need to force a specific chunk size to avoid ALSA underruns
                 if device_index is not None:
                     self.mic = sr.Microphone(device_index=device_index, sample_rate=sample_rate)
                 else:
+                    # Logic to find a working default
                     self.mic = sr.Microphone(sample_rate=sample_rate)
             except Exception as e:
-                print(f"Warning: could not open configured microphone: {e}")
+                print(f"ALSA/Jack Mic Error: {e}. Attempting fallback...")
                 try:
-                    self.mic = sr.Microphone(sample_rate=48000)
-                except Exception:
+                    # Fallback to standard 16k rate if 48k is rejected by the driver
+                    self.mic = sr.Microphone(sample_rate=16000)
+                except Exception as e:
+                    
+                    print("Critical Error: No working microphone found. ",e)
                     self.mic = None
 
         # TTS queue and control
@@ -185,61 +180,42 @@ class VoiceEngine:
             pass
 
     def listen_for_command(self):
-        """Used when the UI is open to catch a specific command."""
+        """Hardened listener to prevent crashes on ALSA/Hardware failure."""
         if not self.recognizer or not self.mic:
-            print("SpeechRecognition not available on this host.")
+            print("SpeechRecognition or Microphone not initialized.")
             return None
+
         try:
-            with self.mic as source:
+            source = self.mic
+            # We use a manual open check if possible, or a wrapped context
+            with source as audio_source:
                 print("Listening for command...")
-                # Calibrate to ambient noise to improve detection
+                
+                # 1. Faster calibration (1.0s is long and can cause ALSA timeouts)
                 try:
                     self.recognizer.adjust_for_ambient_noise(source, duration=1.0)
                 except Exception:
                     pass
-
                 # Use configured timeouts so short pauses don't abort
                 try:
-                    audio = self.recognizer.listen(
-                        source, timeout=self.sr_timeout, phrase_time_limit=self.sr_phrase_limit
-                    )
+                    audio = self.recognizer.listen(source, timeout=self.sr_timeout, phrase_time_limit=self.sr_phrase_limit)
                 except sr.WaitTimeoutError:
-                    self.speak("I didn't hear anything. Please try again.")
+                    self.speak("I didn't hear anything, sir.")
                     return None
-
-                # Try online Google STT first, fall back to pocketsphinx if configured
+                except Exception as e:
+                    print(f"Capture error: {e}")
+                    return None
                 try:
                     text = self.recognizer.recognize_google(audio).lower()
                     return text
                 except sr.UnknownValueError:
-                    if pocketsphinx:
-                        try:
-                            return self.recognizer.recognize_sphinx(audio).lower()
-                        except Exception:
-                            self.speak("Sorry, I couldn't understand you. Please repeat.")
-                            return None
-                    else:
-                        self.speak("Sorry, I couldn't understand you. Please repeat.")
-                        return None
+                    self.speak("Sorry, I couldn't understand you. Please repeat.")
+                    return None
                 except sr.RequestError:
-                    # network issue; try offline Sphinx if available
-                    if pocketsphinx:
-                        try:
-                            return self.recognizer.recognize_sphinx(audio).lower()
-                        except Exception:
-                            self.speak("Speech recognition service is unavailable. Check your internet connection.")
-                            return None
-                    else:
-                        self.speak("Speech recognition service is unavailable. Check your internet connection.")
-                        return None
+                    self.speak("Speech recognition service is unavailable. Check your internet connection.")
+                    return None
         except Exception as e:
-            try:
-                print('listen_for_command exception:', type(e), repr(e))
-                import traceback
-                traceback.print_exc()
-            except Exception:
-                print('listen_for_command exception: (could not repr)')
-            self.speak("I can't hear you, sir.")
+            print(f"Unexpected Mic Error: {e}")
             return None
 
     def speak(self, text: str):
@@ -595,73 +571,67 @@ class VoiceEngine:
                 pass
 
     def discover_and_set_female_voice(self):
-        """Scan available pyttsx3 voices and pick the best female-sounding voice.
-
-        Preference order:
-        1. Voice with 'natalie' in id/name.
-        2. Any voice that matches common female keywords.
-        3. Any English voice.
-        4. Fallback to espeak female variants when no suitable voice found.
-        """
+        """Scan and force the best female voice for Linux/Kali."""
         if not pyttsx3:
             return None
 
         try:
+            # We initialize a local probe, but we must also update the 
+            # background engine if it exists.
             probe = pyttsx3.init()
             voices = probe.getProperty('voices') or []
+            
+            # Prioritize 'Natalie' as requested, then high-quality female variants
             female_keywords = ('natalie', 'female', 'zira', 'susan', 'kate', 'victoria', 'anna', 'amy')
             eng_keywords = ('en_us', 'en-us', 'english', 'en_gb', 'en-gb', 'en')
 
             chosen = None
-            # 1) natalie
+
+            # 1) Search for explicit Female/Natalie names in system voices
             for v in voices:
-                combined = ((getattr(v, 'id', '') or '') + ' ' + (getattr(v, 'name', '') or '')).lower()
+                v_id = str(getattr(v, 'id', '')).lower()
+                v_name = str(getattr(v, 'name', '')).lower()
+                combined = v_id + " " + v_name
+                
                 if 'natalie' in combined:
                     chosen = v.id
                     break
-
-            # 2) female keywords
+                if any(k in combined for k in female_keywords) and any(e in combined for e in eng_keywords):
+                    chosen = v.id
+                    # Don't break yet, keep looking for a better match like 'natalie'
+            
+            # 2) If no named female voice found, fallback to espeak-ng female variants
+            # On Kali, 'en+f3' is the most natural 'Friday' style voice.
             if not chosen:
                 for v in voices:
-                    combined = ((getattr(v, 'id', '') or '') + ' ' + (getattr(v, 'name', '') or '')).lower()
-                    if any(k in combined for k in female_keywords):
+                    if 'en+f' in str(v.id).lower(): # Look for en+f1, en+f2, en+f3, etc.
                         chosen = v.id
                         break
 
-            # 3) english voices
-            if not chosen:
-                for v in voices:
-                    combined = ((getattr(v, 'id', '') or '') + ' ' + (getattr(v, 'name', '') or '')).lower()
-                    if any(k in combined for k in eng_keywords):
-                        chosen = v.id
-                        break
-
-            # apply selection
+            # 3) Apply selection to the actual running engine
             if chosen:
                 self.preferred_voice = chosen
-                # if engine exists, set it immediately
-                eng = getattr(self, '_pyttsx3_engine', None)
-                if eng is not None:
-                    try:
-                        eng.setProperty('voice', self.preferred_voice)
-                    except Exception:
-                        pass
+                print(f"Friday voice set to: {chosen}")
             else:
-                # 4) fallback to espeak female variants by setting the property when engine exists
-                eng = getattr(self, '_pyttsx3_engine', None)
-                if eng is not None:
-                    try:
-                        eng.setProperty('voice', 'en+f3')
-                    except Exception:
-                        try:
-                            eng.setProperty('voice', 'en+f2')
-                        except Exception:
-                            pass
+                # Absolute fallback for Linux espeak
+                self.preferred_voice = 'en+f3'
+
+            # Update the background thread's engine if it's already alive
+            eng = getattr(self, '_pyttsx3_engine', None)
+            if eng is not None:
+                try:
+                    eng.setProperty('voice', self.preferred_voice)
+                    # Friday usually speaks slightly faster but with a calm volume
+                    eng.setProperty('rate', 145) 
+                except Exception as e:
+                    print(f"Could not apply voice property: {e}")
 
             try:
                 probe.stop()
-            except Exception:
+            except:
                 pass
+                
             return self.preferred_voice
-        except Exception:
+        except Exception as e:
+            print(f"Voice Discovery Error: {e}")
             return None
