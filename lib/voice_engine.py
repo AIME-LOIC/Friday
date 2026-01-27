@@ -23,6 +23,11 @@ except Exception:
     gTTS = None
 
 try:
+    import pocketsphinx
+except Exception:
+    pocketsphinx = None
+
+try:
     import pyttsx3
 except Exception:
     pyttsx3 = None
@@ -63,6 +68,19 @@ class VoiceEngine:
             self.recognizer.dynamic_energy_threshold = mic_cfg.get('dynamic_energy', True)
             # Lower pause_threshold for snappier detection of short phrases
             self.recognizer.pause_threshold = mic_cfg.get('pause_threshold', 0.45)
+            # Ensure recognizer.non_speaking_duration <= pause_threshold to avoid
+            # an internal assertion in speech_recognition.listen()
+            try:
+                nsd = getattr(self.recognizer, 'non_speaking_duration', None)
+                if nsd is None:
+                    # set a conservative default if not present
+                    self.recognizer.non_speaking_duration = 0.3
+                else:
+                    if nsd > self.recognizer.pause_threshold:
+                        # reduce non_speaking_duration to be <= pause_threshold
+                        self.recognizer.non_speaking_duration = min(nsd, self.recognizer.pause_threshold)
+            except Exception:
+                pass
 
         # Mixer init if pygame is available - prefer 44100 Hz for gTTS/mp3 playback
         try:
@@ -171,7 +189,6 @@ class VoiceEngine:
         if not self.recognizer or not self.mic:
             print("SpeechRecognition not available on this host.")
             return None
-
         try:
             with self.mic as source:
                 print("Listening for command...")
@@ -180,20 +197,41 @@ class VoiceEngine:
                     self.recognizer.adjust_for_ambient_noise(source, duration=1.0)
                 except Exception:
                     pass
+
                 # Use configured timeouts so short pauses don't abort
                 try:
-                    audio = self.recognizer.listen(source, timeout=self.sr_timeout, phrase_time_limit=self.sr_phrase_limit)
+                    audio = self.recognizer.listen(
+                        source, timeout=self.sr_timeout, phrase_time_limit=self.sr_phrase_limit
+                    )
                 except sr.WaitTimeoutError:
                     self.speak("I didn't hear anything. Please try again.")
                     return None
+
+                # Try online Google STT first, fall back to pocketsphinx if configured
                 try:
-                    return self.recognizer.recognize_google(audio).lower()
+                    text = self.recognizer.recognize_google(audio).lower()
+                    return text
                 except sr.UnknownValueError:
-                    self.speak("Sorry, I couldn't understand you. Please repeat.")
-                    return None
+                    if pocketsphinx:
+                        try:
+                            return self.recognizer.recognize_sphinx(audio).lower()
+                        except Exception:
+                            self.speak("Sorry, I couldn't understand you. Please repeat.")
+                            return None
+                    else:
+                        self.speak("Sorry, I couldn't understand you. Please repeat.")
+                        return None
                 except sr.RequestError:
-                    self.speak("Speech recognition service is unavailable. Check your internet connection.")
-                    return None
+                    # network issue; try offline Sphinx if available
+                    if pocketsphinx:
+                        try:
+                            return self.recognizer.recognize_sphinx(audio).lower()
+                        except Exception:
+                            self.speak("Speech recognition service is unavailable. Check your internet connection.")
+                            return None
+                    else:
+                        self.speak("Speech recognition service is unavailable. Check your internet connection.")
+                        return None
         except Exception as e:
             try:
                 print('listen_for_command exception:', type(e), repr(e))
@@ -465,8 +503,29 @@ class VoiceEngine:
             try:
                 print("Waiting for your voice...")
                 audio = self.recognizer.listen(source, timeout=self.sr_timeout, phrase_time_limit=self.sr_phrase_limit)
-                text = self.recognizer.recognize_google(audio).lower()
-                return text
+                try:
+                    return self.recognizer.recognize_google(audio).lower()
+                except sr.UnknownValueError:
+                    if pocketsphinx:
+                        try:
+                            return self.recognizer.recognize_sphinx(audio).lower()
+                        except Exception:
+                            self.speak("I'm sorry sir, I couldn't understand you.")
+                            return None
+                    else:
+                        self.speak("I'm sorry sir, I couldn't understand you.")
+                        return None
+                except sr.RequestError:
+                    # network issue; try offline Sphinx if available
+                    if pocketsphinx:
+                        try:
+                            return self.recognizer.recognize_sphinx(audio).lower()
+                        except Exception:
+                            self.speak("I'm sorry sir, I couldn't hear you.")
+                            return None
+                    else:
+                        self.speak("I'm sorry sir, I couldn't hear you.")
+                        return None
             except Exception as e:
                 print(f"Mic error: {e}")
                 self.speak("I'm sorry sir, I couldn't hear you.")
