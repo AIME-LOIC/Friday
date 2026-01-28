@@ -1,16 +1,17 @@
 {
   "assistant": {
-    "name": "Personal Assistant",
+    "name": "Friday",
     "version": "2.0",
     "prefer_online_tts":true,
     "voice_speed": 150,
     "voice_volume": 0.9
   },
   "microphone": {
-    "device_index": 0,
-    "energy_threshold": 4000,
-    "dynamic_energy": true
-  },
+        "device_index": 5,
+        "sample_rate": 16000,
+        "energy_threshold": 120,
+        "dynamic_energy": true
+    },
   "speech_recognition": {
     "language": "en-US",
     "timeout": 10,
@@ -29,5 +30,13 @@
     "log_level": "info",
     "save_history": true,
     "history_limit": 1000
-  }
+  },
+  "database": {
+  "enabled": true,
+  "host": "localhost",
+  "port": 5432,
+  "name": "friday",
+  "user": "friday",
+  "password": "sir"
+}
 }

@@ -3,7 +3,27 @@ Personal Voice Assistant
 A Python application using Tkinter GUI, PyAutoGUI, and voice recognition/synthesis
 without any API dependencies for core functionality.
 """
+import os
+import ctypes
 
+# Optional window-management imports for Jarvis-style dashboard
+try:
+    import pygetwindow as gw
+except Exception:
+    gw = None
+
+# Suppress ALSA/JACK library warnings in the console
+def py_error_handler(filename, line, function, err, fmt):
+    pass
+
+ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
+c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
+
+try:
+    asound = ctypes.cdll.LoadLibrary('libasound.so.2')
+    asound.snd_lib_error_set_handler(c_error_handler)
+except:
+    pass
 from pydoc import text
 from email.mime import text
 import tkinter as tk
@@ -12,6 +32,7 @@ import threading
 import datetime
 from lib.voice_engine import VoiceEngine
 from lib.command_processor import CommandProcessor
+from lib.gesture_controller import GestureController
 import os
 import time
 import sys
@@ -36,13 +57,29 @@ class VoiceAssistantGUI:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("Friday Assistant")
-        self.root.geometry("800x600")
+        self.root.title("FRIDAY // Neural Console")
+        self.root.geometry("1100x650")
+        # Jarvis/eDex-style dark background
+        self.root.configure(bg="#050816")
         
         # 1. Initialize engines
         self.voice_engine = VoiceEngine()
-        self.command_processor = CommandProcessor(self.voice_engine)
+        # Try to initialize memory store for chatbot
+        try:
+            from lib.memory_store import FridayMemory
+            memory_store = FridayMemory()
+        except Exception:
+            memory_store = None
+        self.command_processor = CommandProcessor(self.voice_engine, memory_store)
         self.processor = self.command_processor 
+        # Optional: gesture controller (hand open = start, fist = stop)
+        try:
+            self.gesture_controller = GestureController(
+                on_open_hand=self.start_listening,
+                on_closed_fist=self.stop_listening
+            )
+        except Exception:
+            self.gesture_controller = None
         
         # 2. Build the UI
         self.setup_gui()
@@ -50,8 +87,15 @@ class VoiceAssistantGUI:
         # 3. Startup Greeting Logic
         # Give Kali/PipeWire 0.5s to stabilize the audio stream
         import time
+        import random
         time.sleep(0.5)
-        self.voice_engine.speak("Systems online. I am ready, Aime.")
+        greetings = [
+            "Uhm, systems online, bro. I'm ready, Aime.",
+            "Alright dude, I'm online and ready!",
+            "Hey man, systems are up. What's good?",
+            "Bro, I'm ready to go!",
+        ]
+        self.voice_engine.speak(random.choice(greetings))
         
         self.is_listening = False
         self.is_hidden = True 
@@ -86,42 +130,61 @@ class VoiceAssistantGUI:
             time.sleep(0.4)
     def show_interface(self):
         """Bring Friday to the front and start listening."""
+        import random
         self.is_hidden = False
         self.root.deiconify() # Show window
         self.root.attributes("-topmost", True) # Force to front
-        self.voice_engine.speak("Yes? I am here.")
+        responses = [
+            "Uhm, yeah bro, what's up?",
+            "Dude, I'm here! What's going on?",
+            "Hey man, what can I do for you?",
+            "Bro, what's good?",
+        ]
+        self.voice_engine.speak(random.choice(responses))
         self.start_listening()
     def setup_gui(self):
         """Set up the Tkinter GUI components."""
         
-        # Header
-        header_frame = tk.Frame(self.root, bg='#2c3e50')
+        # Header – holographic style bar
+        header_frame = tk.Frame(self.root, bg='#050816')
         header_frame.pack(fill=tk.X, padx=0, pady=0)
+
+        # Left-side "orb" to feel like a tech assistant core
+        self.orb_canvas = tk.Canvas(
+            header_frame,
+            width=64,
+            height=64,
+            bg="#050816",
+            highlightthickness=0,
+            bd=0
+        )
+        self.orb_canvas.pack(side=tk.LEFT, padx=20, pady=8)
+        self._init_orb_visual()
         
         title_label = tk.Label(
             header_frame,
-            text="🎤 Personal Voice Assistant",
-            font=('Helvetica', 18, 'bold'),
-            bg='#2c3e50',
-            fg='white'
+            text="FRIDAY // Interactive OS Console",
+            font=('Consolas', 20, 'bold'),
+            bg='#050816',
+            fg='#00d9ff'
         )
         title_label.pack(pady=15)
         
         # Control Frame
-        control_frame = ttk.Frame(self.root)
-        control_frame.pack(fill=tk.X, padx=20, pady=15)
+        control_frame = tk.Frame(self.root, bg="#050816")
+        control_frame.pack(fill=tk.X, padx=20, pady=10)
         
         # Listen Button
         self.listen_button = tk.Button(
             control_frame,
-            text="🎙️ Start Listening",
+            text="▶ LISTEN",
             command=self.start_listening,
-            bg='#27ae60',
-            fg='white',
-            font=('Helvetica', 12, 'bold'),
+            bg='#00c853',
+            fg='#050816',
+            font=('Consolas', 12, 'bold'),
             padx=20,
             pady=10,
-            relief=tk.RAISED,
+            relief=tk.FLAT,
             cursor='hand2'
         )
         self.listen_button.pack(side=tk.LEFT, padx=5)
@@ -129,14 +192,14 @@ class VoiceAssistantGUI:
         # Stop Button
         self.stop_button = tk.Button(
             control_frame,
-            text="⏹️ Stop",
+            text="■ STOP",
             command=self.stop_listening,
-            bg='#e74c3c',
-            fg='white',
-            font=('Helvetica', 12, 'bold'),
+            bg='#ff1744',
+            fg='#050816',
+            font=('Consolas', 12, 'bold'),
             padx=20,
             pady=10,
-            relief=tk.RAISED,
+            relief=tk.FLAT,
             cursor='hand2',
             state=tk.DISABLED
         )
@@ -145,14 +208,14 @@ class VoiceAssistantGUI:
         # Clear Button
         clear_button = tk.Button(
             control_frame,
-            text="🗑️ Clear Log",
+            text="CLR LOG",
             command=self.clear_log,
-            bg='#95a5a6',
-            fg='white',
-            font=('Helvetica', 12, 'bold'),
+            bg='#263238',
+            fg='#e0f7fa',
+            font=('Consolas', 11, 'bold'),
             padx=20,
             pady=10,
-            relief=tk.RAISED,
+            relief=tk.FLAT,
             cursor='hand2'
         )
         clear_button.pack(side=tk.LEFT, padx=5)
@@ -160,24 +223,54 @@ class VoiceAssistantGUI:
         # Help Button
         help_button = tk.Button(
             control_frame,
-            text="❓ Help",
+            text="HELP",
             command=self.show_help,
-            bg='#3498db',
-            fg='white',
-            font=('Helvetica', 12, 'bold'),
+            bg='#2962ff',
+            fg='#e3f2fd',
+            font=('Consolas', 11, 'bold'),
             padx=20,
             pady=10,
-            relief=tk.RAISED,
+            relief=tk.FLAT,
             cursor='hand2'
         )
         help_button.pack(side=tk.LEFT, padx=5)
         
+        # XO Game Button
+        xo_button = tk.Button(
+            control_frame,
+            text="XO GAME",
+            command=self.start_xo_game,
+            bg='#7b1fa2',
+            fg='#e1bee7',
+            font=('Consolas', 11, 'bold'),
+            padx=20,
+            pady=10,
+            relief=tk.FLAT,
+            cursor='hand2'
+        )
+        xo_button.pack(side=tk.LEFT, padx=5)
+        
+        # Chatbot Mode Button
+        self.chatbot_button = tk.Button(
+            control_frame,
+            text="💬 CHATBOT",
+            command=self.toggle_chatbot,
+            bg='#00bcd4',
+            fg='#050816',
+            font=('Consolas', 11, 'bold'),
+            padx=20,
+            pady=10,
+            relief=tk.FLAT,
+            cursor='hand2'
+        )
+        self.chatbot_button.pack(side=tk.LEFT, padx=5)
+        
         # Settings Frame
-        settings_frame = ttk.LabelFrame(self.root, text="Settings", padding=10)
-        settings_frame.pack(fill=tk.X, padx=20, pady=10)
+        settings_frame = ttk.LabelFrame(self.root, text="AUDIO / VOICE CONTROL", padding=10)
+        settings_frame.pack(fill=tk.X, padx=20, pady=8)
         
         # Voice Speed
-        speed_label = tk.Label(settings_frame, text="Voice Speed:", font=('Helvetica', 10))
+        speed_label = tk.Label(settings_frame, text="Voice Speed", font=('Consolas', 9))
         speed_label.pack(side=tk.LEFT, padx=5)
         
         self.speed_var = tk.IntVar(value=150)
@@ -192,7 +285,7 @@ class VoiceAssistantGUI:
         speed_scale.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         
         # Volume
-        volume_label = tk.Label(settings_frame, text="Volume:", font=('Helvetica', 10))
+        volume_label = tk.Label(settings_frame, text="Volume", font=('Consolas', 9))
         volume_label.pack(side=tk.LEFT, padx=5)
         
         self.volume_var = tk.DoubleVar(value=0.9)
@@ -206,48 +299,204 @@ class VoiceAssistantGUI:
         )
         volume_scale.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         
-        # Output Log
-        log_frame = ttk.LabelFrame(self.root, text="Activity Log", padding=10)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        # Main content split: left = console, right = active windows
+        main_frame = tk.Frame(self.root, bg="#050816")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        left_frame = tk.Frame(main_frame, bg="#050816")
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+
+        right_frame = tk.Frame(main_frame, bg="#050816", width=260)
+        right_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        right_frame.pack_propagate(False)
+
+        # Output Log (left)
+        log_frame = ttk.LabelFrame(left_frame, text="SYSTEM BUS / EVENT STREAM", padding=10)
+        log_frame.pack(fill=tk.BOTH, expand=True)
         
         self.log_text = scrolledtext.ScrolledText(
             log_frame,
             height=15,
-            font=('Courier', 10),
-            bg='#ecf0f1',
-            fg='#2c3e50',
+            font=('Consolas', 10),
+            bg='#050816',
+            fg='#00ffae',
             state=tk.DISABLED
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
         # Status Bar
-        status_frame = tk.Frame(self.root, bg='#34495e', height=30)
+        status_frame = tk.Frame(self.root, bg='#050816', height=30)
         status_frame.pack(fill=tk.X, side=tk.BOTTOM)
         
         self.status_label = tk.Label(
             status_frame,
             text="Ready",
-            font=('Helvetica', 10),
-            bg='#34495e',
-            fg='#2ecc71',
+            font=('Consolas', 10),
+            bg='#050816',
+            fg='#00e676',
             anchor=tk.W,
             padx=10
         )
         self.status_label.pack(fill=tk.X, padx=10, pady=5)
+        # Typed command input (left column, under log)
+        self.command_entry = tk.Entry(left_frame, font=("Consolas", 11), bg="#000814", fg="#e0f7fa", insertbackground="#00e5ff")
+        self.command_entry.pack(pady=(8, 4), fill='x')
+        
+        self.send_button = tk.Button(left_frame, text="EXECUTE", command=self.handle_text_command,
+                                     bg="#1b2735", fg="#e0f7fa", font=("Consolas", 10, "bold"), relief=tk.FLAT)
+        self.send_button.pack(pady=(0, 4), anchor="e")
+
+        # Right column: live window / app overview
+        sidebar_label = tk.Label(
+            right_frame,
+            text="ACTIVE WINDOWS",
+            font=("Consolas", 10, "bold"),
+            bg="#050816",
+            fg="#00e5ff",
+            anchor="w"
+        )
+        sidebar_label.pack(fill=tk.X, pady=(0, 4))
+
+        sidebar_frame = tk.Frame(right_frame, bg="#050816")
+        sidebar_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.window_listbox = tk.Listbox(
+            sidebar_frame,
+            font=("Consolas", 9),
+            bg="#000814",
+            fg="#e0f7fa",
+            selectbackground="#00bfa5",
+            activestyle="none"
+        )
+        self.window_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scrollbar = tk.Scrollbar(sidebar_frame, orient=tk.VERTICAL, command=self.window_listbox.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.window_listbox.config(yscrollcommand=scrollbar.set)
+
+        self.window_listbox.bind("<Double-Button-1>", self.on_window_activate)
+        self._window_handles = []
+
         # Add these where you define your buttons or window properties
         self.root.bind('<space>', lambda e: self.start_listening())
         self.root.bind('<Escape>', lambda e: self.stop_listening())
-        # --- Inside your GUI Class (setup_gui) ---
-        # Create a text entry field
-        self.command_entry = tk.Entry(self.root, font=("Arial", 12))
-        self.command_entry.pack(pady=10, padx=20, fill='x')
-        
-        # Create a Send button
-        self.send_button = tk.Button(self.root, text="Execute Command", command=self.handle_text_command)
-        self.send_button.pack(pady=5)
-        
         # Bind the 'Enter' key to the send function for speed
         self.command_entry.bind('<Return>', lambda event: self.handle_text_command())
+
+        # Kick off periodic refresh of active window list
+        self.refresh_window_list()
+
+    def _init_orb_visual(self):
+        """Draw a simple animated orb to act as a 'core' on the side."""
+        c = self.orb_canvas
+        w = int(c["width"])
+        h = int(c["height"])
+        cx, cy = w // 2, h // 2
+
+        # Base outer ring
+        self._orb_outer = c.create_oval(
+            cx - 28, cy - 28, cx + 28, cy + 28,
+            outline="#00e5ff",
+            width=2
+        )
+        # Inner glow
+        self._orb_inner = c.create_oval(
+            cx - 16, cy - 16, cx + 16, cy + 16,
+            fill="#00bfa5",
+            outline=""
+        )
+        # Pulsing center
+        self._orb_pulse = c.create_oval(
+            cx - 6, cy - 6, cx + 6, cy + 6,
+            fill="#e0f7fa",
+            outline=""
+        )
+        self._orb_pulse_dir = 1
+        self._animate_orb_pulse()
+
+    def _animate_orb_pulse(self):
+        """Subtle breathing animation for the orb center."""
+        try:
+            c = self.orb_canvas
+        except Exception:
+            return
+
+        try:
+            x0, y0, x1, y1 = c.coords(self._orb_pulse)
+        except Exception:
+            return
+
+        # Compute new size
+        delta = 0.8 * self._orb_pulse_dir
+        x0 -= delta
+        y0 -= delta
+        x1 += delta
+        y1 += delta
+
+        # Clamp sizes
+        max_radius = 10
+        min_radius = 4
+        cx = (x0 + x1) / 2
+        cy = (y0 + y1) / 2
+        r = (x1 - x0) / 2
+        if r > max_radius:
+            r = max_radius
+            self._orb_pulse_dir = -1
+        elif r < min_radius:
+            r = min_radius
+            self._orb_pulse_dir = 1
+
+        c.coords(self._orb_pulse, cx - r, cy - r, cx + r, cy + r)
+        # Schedule next frame
+        self.root.after(90, self._animate_orb_pulse)
+
+    def refresh_window_list(self):
+        """Populate the ACTIVE WINDOWS panel using pygetwindow, if available."""
+        if not gw:
+            # If pygetwindow missing, do nothing
+            return
+
+        try:
+            windows = gw.getAllWindows()
+        except Exception:
+            windows = []
+
+        self._window_handles = []
+        self.window_listbox.delete(0, tk.END)
+
+        for w in windows:
+            try:
+                title = (w.title or "").strip()
+                if not title or not w.isVisible:
+                    continue
+                label = title
+                self._window_handles.append(w)
+                self.window_listbox.insert(tk.END, label)
+            except Exception:
+                continue
+
+        # Update every few seconds
+        self.root.after(4000, self.refresh_window_list)
+
+    def on_window_activate(self, event=None):
+        """When the user double-clicks a window entry, bring that app to the front."""
+        if not self._window_handles:
+            return
+        try:
+            idx = self.window_listbox.curselection()
+            if not idx:
+                return
+            w = self._window_handles[idx[0]]
+            try:
+                w.activate()
+            except Exception:
+                try:
+                    w.minimize()
+                    w.restore()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def handle_command(self, text: str):
         """Handle a simple text command (fallback/example)."""
@@ -326,6 +575,30 @@ class VoiceAssistantGUI:
         speed = self.speed_var.get()
         volume = self.volume_var.get()
         self.voice_engine.set_voice_properties(rate=speed, volume=volume)
+    
+    def start_xo_game(self):
+        """Launch XO game via command processor."""
+        if hasattr(self, 'command_processor') and self.command_processor:
+            self.command_processor.start_xo_game("xo")
+        else:
+            self.voice_engine.speak("Command processor not available.")
+    
+    def toggle_chatbot(self):
+        """Toggle chatbot mode on/off."""
+        if not hasattr(self, 'command_processor') or not self.command_processor:
+            self.voice_engine.speak("Command processor not available.")
+            return
+        
+        if not self.command_processor.chatbot:
+            self.voice_engine.speak("Chatbot module not available, bro.")
+            return
+        
+        if self.command_processor.chatbot.chat_mode_active:
+            self.command_processor.chatbot.deactivate()
+            self.chatbot_button.config(text="💬 CHATBOT", bg='#00bcd4')
+        else:
+            self.command_processor.chatbot.activate()
+            self.chatbot_button.config(text="💬 CHAT ON", bg='#4caf50')
     
     def start_listening(self):
         """Start listening for voice commands."""
