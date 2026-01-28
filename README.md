@@ -27,7 +27,7 @@ A Python-based personal voice assistant with Tkinter GUI that understands voice 
 
 ### 1. Navigate to the project directory:
 ```bash
-cd /home/aime/PA/ass/voice_assistant
+cd /home/aime/Friday
 ```
 
 ### 2. Install system dependencies (Ubuntu/Debian):
