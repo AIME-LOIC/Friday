@@ -169,7 +169,7 @@ class FridayGUI:
         ctk.set_default_color_theme("dark-blue")
 
         self.root = ctk.CTk()
-        self.root.title("FRIDAY // Neural Console")
+        self.root.title("FRIDAY")
         self.root.geometry("1200x720")
         self.root.minsize(1100, 650)
         self.root.configure(fg_color=self.colors.bg)
