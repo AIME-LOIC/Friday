@@ -280,6 +280,30 @@ class FridayGUI:
         status_right = ctk.CTkFrame(header_inner, fg_color="transparent")
         status_right.pack(side="right", fill="x", expand=False)
 
+        self.ind_move = ctk.CTkLabel(
+            status_right,
+            text="● MOVE",
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        )
+        self.ind_move.pack(side="right", padx=(12, 0))
+
+        self.ind_dl = ctk.CTkLabel(
+            status_right,
+            text="● DL",
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        )
+        self.ind_dl.pack(side="right", padx=(12, 0))
+
+        self.ind_listen = ctk.CTkLabel(
+            status_right,
+            text="● LISTEN",
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        )
+        self.ind_listen.pack(side="right", padx=(12, 0))
+
         mode_text = "LIMITED MODE" if self.limited_mode else "FULL MODE"
         mode_color = self.colors.warn if self.limited_mode else self.colors.ok
         self.mode_label = ctk.CTkLabel(
@@ -303,6 +327,8 @@ class FridayGUI:
                 height=30,
             )
             fix_btn.pack(side="right", padx=(0, 10))
+
+        self._refresh_indicators()
 
         controls = ctk.CTkFrame(self.root, fg_color=self.colors.bg, corner_radius=0)
         controls.pack(fill="x", padx=18, pady=(6, 10))
@@ -677,6 +703,25 @@ class FridayGUI:
             pass
 
         self.root.after(1000, self._refresh_system_tab)
+
+    def _refresh_indicators(self):
+        try:
+            listening = bool(self.is_listening)
+            downloading = bool(self._download_thread and self._download_thread.is_alive())
+            moving = bool(self._move_thread and self._move_thread.is_alive())
+
+            self.ind_listen.configure(
+                text_color=(self.colors.warn if listening else self.colors.muted)
+            )
+            self.ind_dl.configure(
+                text_color=(self.colors.warn if downloading else self.colors.muted)
+            )
+            self.ind_move.configure(
+                text_color=(self.colors.warn if moving else self.colors.muted)
+            )
+        except Exception:
+            pass
+        self.root.after(400, self._refresh_indicators)
 
     def _build_youtube_tab(self, parent):
         top = ctk.CTkFrame(parent, fg_color="transparent")
