@@ -204,6 +204,34 @@ class FridayGUI:
             node = node[key]
         return node
 
+    def _set_config(self, *path, value):
+        if not path:
+            return
+        node = self._config
+        for key in path[:-1]:
+            if key not in node or not isinstance(node.get(key), dict):
+                node[key] = {}
+            node = node[key]
+        node[path[-1]] = value
+
+    def _schedule_config_write(self):
+        if self._pending_config_write:
+            return
+        self._pending_config_write = True
+        self.root.after(900, self._write_config_now)
+
+    def _write_config_now(self):
+        self._pending_config_write = False
+        try:
+            tmp = f"{self._config_path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._config, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            os.replace(tmp, self._config_path)
+            self.log("Config saved.")
+        except Exception as e:
+            self.log(f"Config save failed: {e}")
+
     def _startup_greeting(self):
         try:
             import random
@@ -520,6 +548,10 @@ class FridayGUI:
         )
         self.yt_out_dir = ctk.StringVar(value=str(cfg_out))
         self.yt_mode = ctk.StringVar(value="Video (best)")
+        try:
+            self.yt_out_dir.trace_add("write", lambda *_: self._on_youtube_out_dir_changed())
+        except Exception:
+            pass
 
         ctk.CTkLabel(
             form,
@@ -618,6 +650,15 @@ class FridayGUI:
             height=38,
         )
         self.yt_open_folder_button.pack(side="left", padx=(10, 0))
+
+    def _on_youtube_out_dir_changed(self):
+        try:
+            val = str(self.yt_out_dir.get())
+            if val:
+                self._set_config("customization", "youtube_download_dir", value=val)
+                self._schedule_config_write()
+        except Exception:
+            pass
 
     def _build_files_tab(self, parent):
         top = ctk.CTkFrame(parent, fg_color="transparent")
@@ -887,6 +928,9 @@ class FridayGUI:
             volume = float(self.volume_var.get())
             self.voice_engine.set_voice_properties(rate=speed, volume=volume)
             self.log(f"Voice updated: speed={speed}, volume={volume:.2f}")
+            self._set_config("assistant", "voice_speed", value=speed)
+            self._set_config("assistant", "voice_volume", value=volume)
+            self._schedule_config_write()
         except Exception:
             pass
 
