@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import datetime
+import json
 import os
 import shlex
 import shutil
@@ -144,6 +145,9 @@ class FridayGUI:
         self._voice_form: dict | None = None
         self.limited_mode = False
         self.command_processor_error: str | None = None
+        self._config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        self._config = self._load_config()
+        self._pending_config_write = False
 
         self.voice_engine = VoiceEngine()
         try:
@@ -174,6 +178,7 @@ class FridayGUI:
                 self.gesture_controller = None
 
         self._build_ui()
+        self.update_voice_settings()
 
         try:
             pygame.mixer.music.set_volume(1.0)
@@ -182,6 +187,22 @@ class FridayGUI:
 
         threading.Thread(target=self.background_listener, daemon=True).start()
         self.root.after(400, self._startup_greeting)
+
+    def _load_config(self) -> dict:
+        try:
+            with open(self._config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _get_config(self, *path, default=None):
+        node = self._config
+        for key in path:
+            if not isinstance(node, dict) or key not in node:
+                return default
+            node = node[key]
+        return node
 
     def _startup_greeting(self):
         try:
@@ -331,7 +352,12 @@ class FridayGUI:
         sliders = ctk.CTkFrame(voice_panel, fg_color="transparent")
         sliders.pack(fill="x", padx=12, pady=(4, 10))
 
-        self.speed_var = ctk.IntVar(value=150)
+        cfg_speed = self._get_config("assistant", "voice_speed", default=150)
+        try:
+            cfg_speed = int(cfg_speed)
+        except Exception:
+            cfg_speed = 150
+        self.speed_var = ctk.IntVar(value=cfg_speed)
         ctk.CTkLabel(
             sliders,
             text="Voice Speed",
@@ -348,7 +374,12 @@ class FridayGUI:
         )
         self.speed_scale.pack(side="left", fill="x", expand=True, padx=(0, 18))
 
-        self.volume_var = ctk.DoubleVar(value=0.9)
+        cfg_vol = self._get_config("assistant", "voice_volume", default=0.9)
+        try:
+            cfg_vol = float(cfg_vol)
+        except Exception:
+            cfg_vol = 0.9
+        self.volume_var = ctk.DoubleVar(value=cfg_vol)
         ctk.CTkLabel(
             sliders,
             text="Volume",
@@ -482,9 +513,12 @@ class FridayGUI:
         form.pack(fill="x", padx=12, pady=(4, 6))
 
         self.yt_url = ctk.StringVar(value="")
-        self.yt_out_dir = ctk.StringVar(
-            value=os.path.join(os.path.expanduser("~"), "Downloads")
+        cfg_out = self._get_config(
+            "customization",
+            "youtube_download_dir",
+            default=os.path.join(os.path.expanduser("~"), "Downloads"),
         )
+        self.yt_out_dir = ctk.StringVar(value=str(cfg_out))
         self.yt_mode = ctk.StringVar(value="Video (best)")
 
         ctk.CTkLabel(
