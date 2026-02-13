@@ -149,6 +149,8 @@ class FridayGUI:
         self._download_thread: threading.Thread | None = None
         self._move_thread: threading.Thread | None = None
         self._voice_form: dict | None = None
+        self._yt_queue: list[dict] = []
+        self._yt_queue_lock = threading.Lock()
         self.limited_mode = False
         self.command_processor_error: str | None = None
         self._config_path = os.path.join(os.path.dirname(__file__), "config.json")
@@ -927,6 +929,25 @@ class FridayGUI:
         )
         self.yt_open_folder_button.pack(side="left", padx=(10, 0))
 
+        queue_card = ctk.CTkFrame(parent, fg_color=self.colors.bg, corner_radius=10)
+        queue_card.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        ctk.CTkLabel(
+            queue_card,
+            text="Download Queue",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+        self.yt_queue_box = ctk.CTkTextbox(
+            queue_card,
+            fg_color=self.colors.bg,
+            text_color=self.colors.text,
+            font=("Consolas", 11),
+            height=220,
+        )
+        self.yt_queue_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.yt_queue_box.configure(state="disabled")
+        self._yt_queue_render()
+
     def _on_youtube_out_dir_changed(self):
         try:
             val = str(self.yt_out_dir.get())
@@ -935,6 +956,58 @@ class FridayGUI:
                 self._schedule_config_write()
         except Exception:
             pass
+
+    def _yt_queue_render(self):
+        try:
+            box = getattr(self, "yt_queue_box", None)
+            if not box:
+                return
+            with self._yt_queue_lock:
+                items = list(self._yt_queue)
+                active = getattr(self, "_yt_active", None)
+            lines = []
+            if active:
+                lines.append(f"ACTIVE: {active.get('url')}")
+                lines.append(f"  Mode: {active.get('mode')} | Out: {active.get('out_dir')}")
+                lines.append("")
+            if items:
+                lines.append("QUEUED:")
+                for i, it in enumerate(items[:12], start=1):
+                    lines.append(f"  {i:02d}. {it.get('url')}")
+            else:
+                lines.append("Queue is empty.")
+
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            box.insert("end", "\n".join(lines) + "\n")
+            box.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _yt_enqueue(self, url: str, out_dir: str, mode: str):
+        item = {"url": url, "out_dir": out_dir, "mode": mode}
+        with self._yt_queue_lock:
+            self._yt_queue.append(item)
+        self._yt_queue_render()
+        self._yt_queue_kick()
+
+    def _yt_queue_kick(self):
+        if self._download_thread and self._download_thread.is_alive():
+            return
+        self._download_thread = threading.Thread(target=self._yt_queue_worker, daemon=True)
+        self._download_thread.start()
+
+    def _yt_queue_worker(self):
+        while True:
+            with self._yt_queue_lock:
+                if not self._yt_queue:
+                    self._yt_active = None
+                    self.root.after(0, self._yt_queue_render)
+                    break
+                item = self._yt_queue.pop(0)
+                self._yt_active = item
+            self.root.after(0, self._yt_queue_render)
+            self._download_youtube_once(item["url"], item["out_dir"], item["mode"])
 
     def _build_files_tab(self, parent):
         top = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1907,23 +1980,11 @@ class FridayGUI:
             messagebox.showwarning("Missing folder", "Choose a download folder.")
             return
         os.makedirs(out_dir, exist_ok=True)
+        self.log(f"Download queued: {url}")
+        self.toast("Added to download queue.", level="ok")
+        self._yt_enqueue(url=url, out_dir=out_dir, mode=mode)
 
-        if self._download_thread and self._download_thread.is_alive():
-            messagebox.showinfo("Download busy", "A download is already running.")
-            return
-
-        self.log(f"Download requested: {url}")
-        self.update_status("Downloading…", self.colors.warn)
-        self.yt_download_button.configure(state="disabled")
-
-        self._download_thread = threading.Thread(
-            target=self._download_youtube_worker,
-            args=(url, out_dir, mode),
-            daemon=True,
-        )
-        self._download_thread.start()
-
-    def _download_youtube_worker(self, url: str, out_dir: str, mode: str):
+    def _download_youtube_once(self, url: str, out_dir: str, mode: str):
         try:
             try:
                 import yt_dlp  # type: ignore
@@ -1997,9 +2058,7 @@ class FridayGUI:
             self.root.after(0, lambda: self.toast("Download failed.", level="error"))
         finally:
             self.root.after(0, lambda: self.update_status("Ready", self.colors.ok))
-            self.root.after(
-                0, lambda: self.yt_download_button.configure(state="normal")
-            )
+            self.root.after(0, self._yt_queue_render)
 
     def _human_bytes(self, n: float) -> str:
         try:
