@@ -447,10 +447,12 @@ class FridayGUI:
         self.tabs.pack(fill="both", expand=True)
 
         self.tab_console = self.tabs.add("Console")
+        self.tab_commands = self.tabs.add("Commands")
         self.tab_youtube = self.tabs.add("YouTube")
         self.tab_files = self.tabs.add("Files")
 
         self._build_console_tab(self.tab_console)
+        self._build_commands_tab(self.tab_commands)
         self._build_youtube_tab(self.tab_youtube)
         self._build_files_tab(self.tab_files)
         self._build_windows_panel(right)
@@ -517,6 +519,78 @@ class FridayGUI:
             height=36,
         )
         self.send_button.pack(side="right")
+
+    def _build_commands_tab(self, parent):
+        head = ctk.CTkFrame(parent, fg_color="transparent")
+        head.pack(fill="x", padx=12, pady=(12, 8))
+        ctk.CTkLabel(
+            head,
+            text="Command Center",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+        ).pack(anchor="w")
+
+        quick = ctk.CTkFrame(parent, fg_color="transparent")
+        quick.pack(fill="x", padx=12, pady=(0, 10))
+
+        ctk.CTkButton(
+            quick,
+            text="VOICE: CREATE FOLDER",
+            command=self._voice_form_start_create_folder,
+            fg_color=self.colors.accent,
+            hover_color="#29f2ff",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            height=38,
+        ).pack(side="left", padx=(0, 10))
+
+        ctk.CTkButton(
+            quick,
+            text="VOICE: MOVE FOLDER",
+            command=self._voice_form_start_move_folder,
+            fg_color=self.colors.accent,
+            hover_color="#29f2ff",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            height=38,
+        ).pack(side="left", padx=(0, 10))
+
+        ctk.CTkButton(
+            quick,
+            text="OPEN DOWNLOADS",
+            command=self._open_youtube_out_dir,
+            fg_color="#1b2735",
+            hover_color="#24384e",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            height=38,
+            width=160,
+        ).pack(side="left")
+
+        card = ctk.CTkFrame(parent, fg_color=self.colors.bg, corner_radius=10)
+        card.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        cheat = (
+            "VOICE TRIGGERS:\n"
+            "  - \"create a new folder\" → voice popup\n"
+            "  - \"move folder\" → voice popup\n"
+            "  - say \"confirm\" / \"cancel\"\n\n"
+            "TYPED COMMANDS (Console tab):\n"
+            "  - download <url> [out_dir]\n"
+            "  - move \"<src_folder>\" \"<dst_folder>\"\n\n"
+            "HOTKEYS:\n"
+            "  - Space: start listening\n"
+            "  - Esc: stop listening\n"
+        )
+        box = ctk.CTkTextbox(
+            card,
+            fg_color=self.colors.bg,
+            text_color=self.colors.text,
+            font=("Consolas", 12),
+        )
+        box.pack(fill="both", expand=True, padx=12, pady=12)
+        box.insert("end", cheat)
+        box.configure(state="disabled")
 
     def _build_youtube_tab(self, parent):
         top = ctk.CTkFrame(parent, fg_color="transparent")
