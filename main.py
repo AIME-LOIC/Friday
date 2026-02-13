@@ -148,6 +148,8 @@ class FridayGUI:
         self._config_path = os.path.join(os.path.dirname(__file__), "config.json")
         self._config = self._load_config()
         self._pending_config_write = False
+        self._cmd_history: list[str] = []
+        self._cmd_history_idx: int | None = None
 
         self.voice_engine = VoiceEngine()
         try:
@@ -500,6 +502,8 @@ class FridayGUI:
         )
         self.command_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
         self.command_entry.bind("<Return>", lambda e: self.handle_text_command())
+        self.command_entry.bind("<Up>", lambda e: self._history_prev())
+        self.command_entry.bind("<Down>", lambda e: self._history_next())
 
         self.send_button = ctk.CTkButton(
             cmd_row,
@@ -1462,6 +1466,7 @@ class FridayGUI:
             return
 
         self.log(f"Typed command: {text}")
+        self._history_push(text)
 
         if self._handle_local_text_commands(text):
             return
@@ -1474,6 +1479,51 @@ class FridayGUI:
 
         if not handled:
             self._fallback_handle_command(text)
+
+    def _history_push(self, text: str):
+        t = (text or "").strip()
+        if not t:
+            return
+        if self._cmd_history and self._cmd_history[-1] == t:
+            self._cmd_history_idx = None
+            return
+        self._cmd_history.append(t)
+        if len(self._cmd_history) > 200:
+            self._cmd_history = self._cmd_history[-200:]
+        self._cmd_history_idx = None
+
+    def _history_prev(self):
+        if not self._cmd_history:
+            return "break"
+        if self._cmd_history_idx is None:
+            self._cmd_history_idx = len(self._cmd_history) - 1
+        else:
+            self._cmd_history_idx = max(0, self._cmd_history_idx - 1)
+        self._history_apply()
+        return "break"
+
+    def _history_next(self):
+        if not self._cmd_history:
+            return "break"
+        if self._cmd_history_idx is None:
+            return "break"
+        self._cmd_history_idx += 1
+        if self._cmd_history_idx >= len(self._cmd_history):
+            self._cmd_history_idx = None
+            self.command_entry.delete(0, "end")
+            return "break"
+        self._history_apply()
+        return "break"
+
+    def _history_apply(self):
+        if self._cmd_history_idx is None:
+            return
+        try:
+            text = self._cmd_history[self._cmd_history_idx]
+        except Exception:
+            return
+        self.command_entry.delete(0, "end")
+        self.command_entry.insert(0, text)
 
     def _handle_local_text_commands(self, text: str) -> bool:
         try:
