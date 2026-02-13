@@ -32,6 +32,7 @@ class GestureController:
         on_status=None,
         dispatcher=None,
         show_preview: bool = False,
+        model_path: str | None = None,
     ):
         self.on_open_hand = on_open_hand
         self.on_closed_fist = on_closed_fist
@@ -40,6 +41,7 @@ class GestureController:
         self.on_status = on_status
         self.dispatcher = dispatcher
         self.show_preview = show_preview
+        self.model_path = model_path
         self._stop = threading.Event()
         self._thread = None
 
@@ -47,17 +49,12 @@ class GestureController:
             # Dependencies not available – no-op controller
             self._emit_status("Gesture controller disabled (missing cv2/mediapipe).")
             return
-        if not hasattr(mp, "solutions"):
-            self._emit_status(
-                "Gesture controller disabled (this MediaPipe build has no mp.solutions)."
-            )
-            return
 
         if start_immediately:
             self.start()
 
     def start(self):
-        if not cv2 or not mp or not hasattr(mp, "solutions"):
+        if not cv2 or not mp:
             return
         if self._thread and self._thread.is_alive():
             return
@@ -107,7 +104,7 @@ class GestureController:
             pass
 
     def _run(self):
-        if not cv2 or not mp or not hasattr(mp, "solutions"):
+        if not cv2 or not mp:
             return
 
         cap = cv2.VideoCapture(int(self.camera_index))
@@ -117,13 +114,55 @@ class GestureController:
             return
 
         self._emit_status(f"Camera {self.camera_index} opened.")
-        mp_hands = mp.solutions.hands
-        hands = mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.6,
-        )
+        use_solutions = hasattr(mp, "solutions")
+        hands = None
+        landmarker = None
+        running_mode_video = None
+
+        if use_solutions:
+            mp_hands = mp.solutions.hands
+            hands = mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=1,
+                min_detection_confidence=0.6,
+                min_tracking_confidence=0.6,
+            )
+            self._emit_status("Gesture backend: mp.solutions.hands")
+        else:
+            # Fallback to MediaPipe Tasks API (requires model file).
+            try:
+                from mediapipe.tasks import python as mp_python
+                from mediapipe.tasks.python import vision
+            except Exception as e:
+                self._emit_status(f"Gesture controller disabled (tasks import failed): {e}")
+                cap.release()
+                return
+
+            model_path = self.model_path
+            if not model_path:
+                self._emit_status(
+                    "Gesture controller disabled (no model_path; expected hand_landmarker.task)."
+                )
+                cap.release()
+                return
+
+            try:
+                base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
+                options = vision.HandLandmarkerOptions(
+                    base_options=base_options,
+                    running_mode=vision.RunningMode.VIDEO,
+                    num_hands=1,
+                    min_hand_detection_confidence=0.6,
+                    min_hand_presence_confidence=0.6,
+                    min_tracking_confidence=0.6,
+                )
+                landmarker = vision.HandLandmarker.create_from_options(options)
+                running_mode_video = vision.RunningMode.VIDEO
+                self._emit_status("Gesture backend: mediapipe.tasks HandLandmarker")
+            except Exception as e:
+                self._emit_status(f"Gesture controller disabled (model load failed): {e}")
+                cap.release()
+                return
 
         last_action = 0.0
 
@@ -137,17 +176,29 @@ class GestureController:
                 # Mirror like a selfie camera
                 frame = cv2.flip(frame, 1)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                result = hands.process(rgb)
+                landmarks = None
+                if hands is not None:
+                    result = hands.process(rgb)
+                    if result.multi_hand_landmarks:
+                        landmarks = result.multi_hand_landmarks[0].landmark
+                elif landmarker is not None:
+                    try:
+                        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                        ts_ms = int(time.time() * 1000)
+                        result = landmarker.detect_for_video(mp_image, ts_ms)
+                        if getattr(result, "hand_landmarks", None):
+                            landmarks = result.hand_landmarks[0]
+                    except Exception:
+                        landmarks = None
 
-                if result.multi_hand_landmarks:
-                    lm = result.multi_hand_landmarks[0]
+                if landmarks:
                     # Simple heuristic: count "extended" fingers based on y-position
-                    tip_ids = [4, 8, 12, 16, 20]
+                    tip_ids = [4, 8, 12, 16, 20]  # (thumb tip unused)
                     fingers_up = 0
                     # Use wrist as approximate palm reference
-                    wrist_y = lm.landmark[0].y
+                    wrist_y = landmarks[0].y
                     for tid in tip_ids[1:]:  # ignore thumb for simplicity
-                        if lm.landmark[tid].y < wrist_y:  # above wrist -> extended
+                        if landmarks[tid].y < wrist_y:  # above wrist -> extended
                             fingers_up += 1
 
                     now = time.time()
@@ -172,7 +223,13 @@ class GestureController:
                     time.sleep(0.01)
         finally:
             try:
-                hands.close()
+                if hands is not None:
+                    hands.close()
+            except Exception:
+                pass
+            try:
+                if landmarker is not None:
+                    landmarker.close()
             except Exception:
                 pass
             cap.release()
