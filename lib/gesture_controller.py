@@ -25,6 +25,8 @@ class GestureController:
         self,
         on_open_hand=None,
         on_closed_fist=None,
+        on_two_fingers=None,
+        on_detection=None,
         *,
         camera_index: int = 0,
         start_immediately: bool = True,
@@ -36,6 +38,8 @@ class GestureController:
     ):
         self.on_open_hand = on_open_hand
         self.on_closed_fist = on_closed_fist
+        self.on_two_fingers = on_two_fingers
+        self.on_detection = on_detection
         self.camera_index = camera_index
         self.cooldown_s = max(0.0, float(cooldown_s))
         self.on_status = on_status
@@ -205,9 +209,14 @@ class GestureController:
                     if self.cooldown_s and (now - last_action) < self.cooldown_s:
                         pass
                     else:
+                        if callable(self.on_detection):
+                            self._dispatch(lambda f=fingers_up: self.on_detection(f))
                         if fingers_up >= 3:
                             last_action = now
                             self._dispatch(self.on_open_hand)
+                        elif fingers_up == 2:
+                            last_action = now
+                            self._dispatch(self.on_two_fingers)
                         elif fingers_up == 0:
                             last_action = now
                             self._dispatch(self.on_closed_fist)

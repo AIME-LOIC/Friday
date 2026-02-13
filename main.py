@@ -195,6 +195,7 @@ class FridayGUI:
 
         self.gesture_controller = None
         self._gesture_status = ctk.StringVar(value="Gestures: not started")
+        self._last_gesture = ctk.StringVar(value="Last gesture: —")
 
         self._build_ui()
         self.update_voice_settings()
@@ -934,6 +935,14 @@ class FridayGUI:
             justify="left",
         ).pack(anchor="w")
 
+        ctk.CTkLabel(
+            status_row,
+            textvariable=self._last_gesture,
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            justify="left",
+        ).pack(anchor="w", pady=(2, 0))
+
         deps = []
         if GestureController is None:
             deps.append("GestureController import failed (check deps).")
@@ -1065,6 +1074,20 @@ class FridayGUI:
     def _gesture_set_status(self, msg: str):
         self._gesture_status.set(f"Gestures: {msg}")
 
+    def _set_last_gesture(self, label: str):
+        txt = f"Last gesture: {label}"
+        try:
+            self._last_gesture.set(txt)
+        except Exception:
+            pass
+        self.log(f"Gesture detected: {label}")
+
+    def _open_camera_tab(self):
+        try:
+            self.tabs.set("Camera")
+        except Exception:
+            pass
+
     def test_camera(self):
         try:
             import cv2  # type: ignore
@@ -1128,10 +1151,31 @@ class FridayGUI:
             self._gesture_set_status(msg)
             self.log(f"Gesture status: {msg}")
 
+        def on_detection(fingers: int):
+            try:
+                if fingers >= 3:
+                    self._set_last_gesture(f"{fingers} fingers (listen)")
+                elif fingers == 2:
+                    self._set_last_gesture("2 fingers (camera tab)")
+                elif fingers == 0:
+                    self._set_last_gesture("fist (stop)")
+                else:
+                    self._set_last_gesture(f"{fingers} fingers")
+            except Exception:
+                pass
+
         try:
             self.gesture_controller = GestureController(
-                on_open_hand=lambda: self.root.after(0, self.start_listening),
-                on_closed_fist=lambda: self.root.after(0, self.stop_listening),
+                on_open_hand=lambda: self.root.after(
+                    0, lambda: (self._set_last_gesture("open hand"), self.start_listening())
+                ),
+                on_two_fingers=lambda: self.root.after(
+                    0, lambda: (self._set_last_gesture("two fingers"), self._open_camera_tab())
+                ),
+                on_closed_fist=lambda: self.root.after(
+                    0, lambda: (self._set_last_gesture("fist"), self.stop_listening())
+                ),
+                on_detection=lambda f: self.root.after(0, lambda: on_detection(f)),
                 camera_index=idx,
                 start_immediately=True,
                 cooldown_s=1.2,
