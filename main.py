@@ -88,6 +88,11 @@ if _FRIDAY_HEADLESS:
 
 import pygame
 
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None
+
 
 @dataclass(frozen=True)
 class FridayColors:
@@ -448,11 +453,13 @@ class FridayGUI:
 
         self.tab_console = self.tabs.add("Console")
         self.tab_commands = self.tabs.add("Commands")
+        self.tab_system = self.tabs.add("System")
         self.tab_youtube = self.tabs.add("YouTube")
         self.tab_files = self.tabs.add("Files")
 
         self._build_console_tab(self.tab_console)
         self._build_commands_tab(self.tab_commands)
+        self._build_system_tab(self.tab_system)
         self._build_youtube_tab(self.tab_youtube)
         self._build_files_tab(self.tab_files)
         self._build_windows_panel(right)
@@ -591,6 +598,85 @@ class FridayGUI:
         box.pack(fill="both", expand=True, padx=12, pady=12)
         box.insert("end", cheat)
         box.configure(state="disabled")
+
+    def _build_system_tab(self, parent):
+        head = ctk.CTkFrame(parent, fg_color="transparent")
+        head.pack(fill="x", padx=12, pady=(12, 8))
+        ctk.CTkLabel(
+            head,
+            text="System Telemetry",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+        ).pack(anchor="w")
+
+        note = (
+            "Tip: Install psutil for richer stats.\n"
+            "  pip install psutil"
+            if psutil is None
+            else "Live system stats (via psutil)."
+        )
+        ctk.CTkLabel(
+            head,
+            text=note,
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+        card = ctk.CTkFrame(parent, fg_color=self.colors.bg, corner_radius=10)
+        card.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        self.system_text = ctk.CTkTextbox(
+            card, fg_color=self.colors.bg, text_color=self.colors.text, font=("Consolas", 12)
+        )
+        self.system_text.pack(fill="both", expand=True, padx=12, pady=12)
+        self.system_text.configure(state="disabled")
+
+        self._refresh_system_tab()
+
+    def _refresh_system_tab(self):
+        lines = []
+        now = datetime.datetime.now()
+        lines.append(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"Platform: {sys.platform}")
+        lines.append(f"Python: {sys.version.split()[0]}")
+        lines.append("")
+
+        if psutil is not None:
+            try:
+                cpu = psutil.cpu_percent(interval=None)
+                mem = psutil.virtual_memory()
+                disk = psutil.disk_usage(os.path.expanduser("~"))
+                lines.append(f"CPU: {cpu:5.1f}%")
+                lines.append(
+                    f"RAM: {mem.percent:5.1f}%  ({self._human_bytes(mem.used)} / {self._human_bytes(mem.total)})"
+                )
+                lines.append(
+                    f"Disk(~): {disk.percent:5.1f}% ({self._human_bytes(disk.used)} / {self._human_bytes(disk.total)})"
+                )
+            except Exception as e:
+                lines.append(f"psutil error: {e}")
+        else:
+            try:
+                st = os.statvfs(os.path.expanduser("~"))
+                total = st.f_frsize * st.f_blocks
+                free = st.f_frsize * st.f_bavail
+                used = total - free
+                pct = (used / total * 100.0) if total else 0.0
+                lines.append(f"Disk(~): {pct:5.1f}% ({self._human_bytes(used)} / {self._human_bytes(total)})")
+            except Exception:
+                lines.append("Disk(~): unavailable")
+
+        text = "\n".join(lines) + "\n"
+        try:
+            self.system_text.configure(state="normal")
+            self.system_text.delete("1.0", "end")
+            self.system_text.insert("end", text)
+            self.system_text.configure(state="disabled")
+        except Exception:
+            pass
+
+        self.root.after(1000, self._refresh_system_tab)
 
     def _build_youtube_tab(self, parent):
         top = ctk.CTkFrame(parent, fg_color="transparent")
