@@ -1147,9 +1147,13 @@ class FridayGUI:
 
     def _on_window_move_toggle(self):
         if bool(self._window_move_enabled.get()):
-            if gw is None:
+            if gw is None and not self._has_xdotool():
                 self._window_move_enabled.set(False)
-                self.toast("pygetwindow missing; window move unavailable.", level="error", ms=4500)
+                self.toast(
+                    "Window move unavailable (need xdotool on Linux).",
+                    level="error",
+                    ms=4500,
+                )
                 return
             self.toast("Window move enabled (4 fingers).", level="ok")
         else:
@@ -1185,14 +1189,17 @@ class FridayGUI:
             pass
 
     def _window_drag_start(self, x: float, y: float):
-        if gw is None:
-            return
-        try:
-            win = gw.getActiveWindow()
-        except Exception:
-            win = None
-        if not win:
-            return
+        win = None
+        xwid = None
+        if gw is not None:
+            try:
+                win = gw.getActiveWindow()
+            except Exception:
+                win = None
+        if win is None:
+            xwid = self._xdotool_active_window_id()
+            if not xwid:
+                return
         try:
             if pyautogui is None:
                 return
@@ -1200,7 +1207,27 @@ class FridayGUI:
             px = int(x * sw)
             py = int(y * sh)
             # Offset cursor->window top-left so it "sticks"
-            self._window_drag = {"active": True, "win": win, "dx": px - win.left, "dy": py - win.top}
+            if win is not None:
+                self._window_drag = {
+                    "active": True,
+                    "win": win,
+                    "backend": "pygetwindow",
+                    "dx": px - win.left,
+                    "dy": py - win.top,
+                }
+            else:
+                geom = self._xdotool_window_geometry(xwid)
+                if not geom:
+                    return
+                left = int(geom.get("X", "0"))
+                top = int(geom.get("Y", "0"))
+                self._window_drag = {
+                    "active": True,
+                    "win": xwid,
+                    "backend": "xdotool",
+                    "dx": px - left,
+                    "dy": py - top,
+                }
             self._set_last_gesture("window drag start")
         except Exception:
             self._window_drag = {"active": False, "win": None, "dx": 0, "dy": 0}
@@ -1209,6 +1236,7 @@ class FridayGUI:
         if not self._window_drag.get("active"):
             return
         win = self._window_drag.get("win")
+        backend = self._window_drag.get("backend")
         if not win or pyautogui is None:
             return
         try:
@@ -1217,7 +1245,10 @@ class FridayGUI:
             py = int(y * sh)
             nx = px - int(self._window_drag.get("dx", 0))
             ny = py - int(self._window_drag.get("dy", 0))
-            win.moveTo(nx, ny)
+            if backend == "xdotool":
+                self._xdotool_window_move(str(win), nx, ny)
+            else:
+                win.moveTo(nx, ny)
         except Exception:
             pass
 
@@ -1231,13 +1262,20 @@ class FridayGUI:
             return
         try:
             if gw is not None:
-                win = gw.getActiveWindow()
+                try:
+                    win = gw.getActiveWindow()
+                except Exception:
+                    win = None
                 if win:
                     try:
                         win.close()
                         return
                     except Exception:
                         pass
+            wid = self._xdotool_active_window_id()
+            if wid:
+                self._xdotool_window_close(wid)
+                return
             if pyautogui is not None:
                 pyautogui.hotkey("alt", "f4")
         except Exception:
@@ -1984,26 +2022,43 @@ class FridayGUI:
     # Active windows
     # ---------------------------
     def refresh_window_list(self):
-        if not gw:
-            return
-
-        try:
-            windows = gw.getAllWindows()
-        except Exception:
-            windows = []
-
         self._window_handles = []
         self.window_listbox.delete(0, "end")
 
-        for w in windows:
+        # Backend 1: pygetwindow (not supported on Linux in many versions)
+        if gw:
             try:
-                title = (w.title or "").strip()
-                if not title or not w.isVisible:
-                    continue
-                self._window_handles.append(w)
-                self.window_listbox.insert("end", title)
+                windows = gw.getAllWindows()
             except Exception:
-                continue
+                windows = []
+
+            for w in windows:
+                try:
+                    title = (w.title or "").strip()
+                    if not title or not w.isVisible:
+                        continue
+                    self._window_handles.append(w)
+                    self.window_listbox.insert("end", title)
+                except Exception:
+                    continue
+        else:
+            # Backend 2 (Linux/X11): xdotool
+            if self._has_xdotool():
+                try:
+                    ids = self._xdotool("search", "--onlyvisible", "--name", ".")
+                    win_ids = [line.strip() for line in ids.splitlines() if line.strip()]
+                except Exception:
+                    win_ids = []
+
+                for wid in win_ids[:80]:
+                    try:
+                        title = self._xdotool("getwindowname", wid).strip()
+                        if not title:
+                            continue
+                        self._window_handles.append(("xdotool", wid))
+                        self.window_listbox.insert("end", title)
+                    except Exception:
+                        continue
 
         self.root.after(4000, self.refresh_window_list)
 
@@ -2015,14 +2070,60 @@ class FridayGUI:
             if not idx:
                 return
             w = self._window_handles[idx[0]]
-            try:
-                w.activate()
-            except Exception:
+            if isinstance(w, tuple) and w and w[0] == "xdotool":
+                self._xdotool("windowactivate", "--sync", str(w[1]))
+            else:
                 try:
-                    w.minimize()
-                    w.restore()
+                    w.activate()
                 except Exception:
-                    pass
+                    try:
+                        w.minimize()
+                        w.restore()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _has_xdotool(self) -> bool:
+        return shutil.which("xdotool") is not None
+
+    def _xdotool(self, *args: str) -> str:
+        out = subprocess.check_output(["xdotool", *args], text=True, stderr=subprocess.DEVNULL)
+        return (out or "").strip()
+
+    def _xdotool_active_window_id(self) -> str | None:
+        if not self._has_xdotool():
+            return None
+        try:
+            wid = self._xdotool("getactivewindow").strip()
+            return wid or None
+        except Exception:
+            return None
+
+    def _xdotool_window_geometry(self, wid: str) -> dict | None:
+        try:
+            out = self._xdotool("getwindowgeometry", "--shell", wid)
+            data = {}
+            for line in out.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    data[k.strip()] = v.strip()
+            # Expect X,Y,WIDTH,HEIGHT
+            if "X" in data and "Y" in data:
+                return data
+        except Exception:
+            return None
+        return None
+
+    def _xdotool_window_move(self, wid: str, x: int, y: int):
+        try:
+            self._xdotool("windowmove", wid, str(int(x)), str(int(y)))
+        except Exception:
+            pass
+
+    def _xdotool_window_close(self, wid: str):
+        try:
+            self._xdotool("windowclose", wid)
         except Exception:
             pass
 
