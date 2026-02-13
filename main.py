@@ -151,6 +151,7 @@ class FridayGUI:
         self._voice_form: dict | None = None
         self._yt_queue: list[dict] = []
         self._yt_queue_lock = threading.Lock()
+        self._last_download_path: str | None = None
         self.limited_mode = False
         self.command_processor_error: str | None = None
         self._config_path = os.path.join(os.path.dirname(__file__), "config.json")
@@ -928,6 +929,20 @@ class FridayGUI:
             height=38,
         )
         self.yt_open_folder_button.pack(side="left", padx=(10, 0))
+
+        self.yt_open_last_button = ctk.CTkButton(
+            actions,
+            text="OPEN LAST",
+            command=self._open_last_download,
+            fg_color="#1b2735",
+            hover_color="#24384e",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=140,
+            height=38,
+            state="disabled",
+        )
+        self.yt_open_last_button.pack(side="left", padx=(10, 0))
 
         queue_card = ctk.CTkFrame(parent, fg_color=self.colors.bg, corner_radius=10)
         queue_card.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -1966,6 +1981,24 @@ class FridayGUI:
         except Exception as e:
             self.log(f"Could not open folder: {e}")
 
+    def _open_last_download(self):
+        path = self._last_download_path
+        if not path:
+            messagebox.showinfo("No file yet", "No completed download to open yet.")
+            return
+        if not os.path.exists(path):
+            messagebox.showwarning("Missing file", "Last downloaded file was not found.")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            self.log(f"Could not open file: {e}")
+
     def download_youtube_from_ui(self):
         url = self.yt_url.get().strip()
         out_dir = self.yt_out_dir.get().strip()
@@ -2024,7 +2057,15 @@ class FridayGUI:
             last_progress = {"t": 0.0, "msg": ""}
 
             def hook(d):
-                if d.get("status") != "downloading":
+                status = d.get("status")
+                if status == "finished":
+                    filename = d.get("filename")
+                    if filename:
+                        self._last_download_path = filename
+                        self.root.after(0, lambda: self.yt_open_last_button.configure(state="normal"))
+                        self.root.after(0, self._yt_queue_render)
+                    return
+                if status != "downloading":
                     return
                 now = time.time()
                 if now - last_progress["t"] < 0.6:
