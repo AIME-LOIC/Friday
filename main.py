@@ -142,6 +142,8 @@ class FridayGUI:
         self._download_thread: threading.Thread | None = None
         self._move_thread: threading.Thread | None = None
         self._voice_form: dict | None = None
+        self.limited_mode = False
+        self.command_processor_error: str | None = None
 
         self.voice_engine = VoiceEngine()
         try:
@@ -152,7 +154,11 @@ class FridayGUI:
             memory_store = None
 
         if CommandProcessor is None:
-            self.command_processor = _FallbackCommandProcessor(self.voice_engine, _command_processor_import_error)  # type: ignore[arg-type]
+            self.limited_mode = True
+            self.command_processor_error = str(_command_processor_import_error)
+            self.command_processor = _FallbackCommandProcessor(
+                self.voice_engine, _command_processor_import_error
+            )  # type: ignore[arg-type]
         else:
             self.command_processor = CommandProcessor(self.voice_engine, memory_store)
 
@@ -214,6 +220,33 @@ class FridayGUI:
             font=ctk.CTkFont(family="Consolas", size=22, weight="bold"),
         )
         title.pack(side="left", pady=0)
+
+        status_right = ctk.CTkFrame(header_inner, fg_color="transparent")
+        status_right.pack(side="right", fill="x", expand=False)
+
+        mode_text = "LIMITED MODE" if self.limited_mode else "FULL MODE"
+        mode_color = self.colors.warn if self.limited_mode else self.colors.ok
+        self.mode_label = ctk.CTkLabel(
+            status_right,
+            text=mode_text,
+            text_color=mode_color,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        )
+        self.mode_label.pack(side="right", padx=(12, 0))
+
+        if self.limited_mode:
+            fix_btn = ctk.CTkButton(
+                status_right,
+                text="FIX DEPS",
+                command=self.show_dependency_help,
+                fg_color="#1b2735",
+                hover_color="#24384e",
+                text_color=self.colors.text,
+                font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+                width=110,
+                height=30,
+            )
+            fix_btn.pack(side="right", padx=(0, 10))
 
         controls = ctk.CTkFrame(self.root, fg_color=self.colors.bg, corner_radius=0)
         controls.pack(fill="x", padx=18, pady=(6, 10))
@@ -1653,6 +1686,28 @@ class FridayGUI:
         )
         box.pack(fill="both", expand=True, padx=14, pady=14)
         box.insert("end", help_text)
+        box.configure(state="disabled")
+
+    def show_dependency_help(self):
+        err = self.command_processor_error or "Unknown import error."
+        text = (
+            "Some optional dependencies are missing, so FRIDAY is running in LIMITED MODE.\n\n"
+            f"Import error:\n{err}\n\n"
+            "Fix:\n"
+            "  pip install -r requirements.txt\n\n"
+            "Then run:\n"
+            "  python main.py\n"
+        )
+        win = ctk.CTkToplevel(self.root)
+        win.title("Fix Dependencies")
+        win.geometry("760x420")
+        win.configure(fg_color=self.colors.bg)
+
+        box = ctk.CTkTextbox(
+            win, fg_color=self.colors.bg, text_color=self.colors.text, font=("Consolas", 11)
+        )
+        box.pack(fill="both", expand=True, padx=14, pady=14)
+        box.insert("end", text)
         box.configure(state="disabled")
 
 
