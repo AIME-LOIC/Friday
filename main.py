@@ -94,10 +94,9 @@ except Exception:
     psutil = None
 
 try:
-    from PIL import Image, ImageTk  # type: ignore
+    from PIL import Image  # type: ignore
 except Exception:
     Image = None  # type: ignore[assignment]
-    ImageTk = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -172,6 +171,10 @@ class FridayGUI:
         self._camera_preview_lock = threading.Lock()
         self._camera_preview_pil = None
         self._camera_preview_photo = None
+        self._camera_preview_ctk_img = None
+        self._gesture_model_path = os.path.join(
+            os.path.dirname(__file__), "models", "hand_landmarker.task"
+        )
 
         self.voice_engine = VoiceEngine()
         try:
@@ -901,6 +904,28 @@ class FridayGUI:
         status_row = ctk.CTkFrame(card, fg_color="transparent")
         status_row.pack(fill="x", padx=12, pady=(0, 12))
 
+        self._gesture_model_status = ctk.StringVar(value="")
+        model_row = ctk.CTkFrame(card, fg_color="transparent")
+        model_row.pack(fill="x", padx=12, pady=(0, 10))
+        ctk.CTkLabel(
+            model_row,
+            textvariable=self._gesture_model_status,
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            justify="left",
+        ).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            model_row,
+            text="MODEL HELP",
+            command=self.show_gesture_model_help,
+            fg_color="#1b2735",
+            hover_color="#24384e",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=10, weight="bold"),
+            width=130,
+            height=30,
+        ).pack(side="right")
+
         ctk.CTkLabel(
             status_row,
             textvariable=self._gesture_status,
@@ -943,6 +968,19 @@ class FridayGUI:
         )
         self.camera_preview_label.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self._camera_preview_ui_tick()
+
+        try:
+            import mediapipe as mp  # type: ignore
+
+            if hasattr(mp, "solutions"):
+                self._gesture_model_status.set("Model: not needed (mp.solutions available).")
+            else:
+                ok = os.path.exists(self._gesture_model_path)
+                self._gesture_model_status.set(
+                    f"Model: {'OK' if ok else 'MISSING'} — {self._gesture_model_path}"
+                )
+        except Exception:
+            self._gesture_model_status.set(f"Model: {self._gesture_model_path}")
 
     def _refresh_system_tab(self):
         lines = []
@@ -1058,15 +1096,25 @@ class FridayGUI:
         if GestureController is None:
             self.toast("Gesture controller unavailable (missing deps).", level="error")
             return
+        use_tasks = False
         try:
             import mediapipe as mp  # type: ignore
 
-            if not hasattr(mp, "solutions"):
-                self.toast("MediaPipe has no mp.solutions on this Python build.", level="error", ms=4500)
-                self._gesture_set_status("disabled (mp.solutions missing)")
-                return
+            use_tasks = not hasattr(mp, "solutions")
         except Exception:
-            pass
+            use_tasks = False
+
+        model_path = None
+        if use_tasks:
+            model_path = self._gesture_model_path
+            if not os.path.exists(model_path):
+                self.toast("Gesture model missing (hand_landmarker.task).", level="error", ms=5000)
+                self._gesture_set_status("missing model (hand_landmarker.task)")
+                try:
+                    self.show_gesture_model_help()
+                except Exception:
+                    pass
+                return
 
         idx = int(getattr(self, "camera_index_var", ctk.IntVar(value=0)).get())
 
@@ -1090,6 +1138,7 @@ class FridayGUI:
                 on_status=on_status,
                 dispatcher=dispatch,
                 show_preview=False,
+                model_path=model_path,
             )
             self.gesture_start_btn.configure(state="disabled")
             self.gesture_stop_btn.configure(state="normal")
@@ -1115,7 +1164,7 @@ class FridayGUI:
         self._gesture_set_status("stopped")
 
     def start_camera_preview(self):
-        if Image is None or ImageTk is None:
+        if Image is None:
             self.toast("Pillow missing; camera preview unavailable.", level="error")
             return
         try:
@@ -1194,12 +1243,39 @@ class FridayGUI:
             img = None
             with self._camera_preview_lock:
                 img = self._camera_preview_pil
-            if img is not None and ImageTk is not None:
-                self._camera_preview_photo = ImageTk.PhotoImage(img)
-                self.camera_preview_label.configure(image=self._camera_preview_photo, text="")
+            if img is not None:
+                self._camera_preview_ctk_img = ctk.CTkImage(
+                    light_image=img, dark_image=img, size=(960, 540)
+                )
+                self.camera_preview_label.configure(image=self._camera_preview_ctk_img, text="")
         except Exception:
             pass
         self.root.after(60, self._camera_preview_ui_tick)
+
+    def show_gesture_model_help(self):
+        models_dir = os.path.join(os.path.dirname(__file__), "models")
+        path = self._gesture_model_path
+        text = (
+            "Your MediaPipe build uses the Tasks API (no mp.solutions).\n"
+            "To enable hand-gesture control, download the MediaPipe model:\n"
+            "  hand_landmarker.task\n\n"
+            "Place it here:\n"
+            f"  {path}\n\n"
+            "Then restart FRIDAY and click START in the Camera tab.\n\n"
+            "Tip:\n"
+            f"  Create folder: {models_dir}\n"
+        )
+        win = ctk.CTkToplevel(self.root)
+        win.title("Gesture Model Help")
+        win.geometry("820x460")
+        win.configure(fg_color=self.colors.bg)
+
+        box = ctk.CTkTextbox(
+            win, fg_color=self.colors.bg, text_color=self.colors.text, font=("Consolas", 11)
+        )
+        box.pack(fill="both", expand=True, padx=14, pady=14)
+        box.insert("end", text)
+        box.configure(state="disabled")
 
     def _build_youtube_tab(self, parent):
         top = ctk.CTkFrame(parent, fg_color="transparent")
