@@ -377,6 +377,19 @@ class FridayGUI:
         )
         clear_button.pack(side="left", padx=(0, 10))
 
+        export_button = ctk.CTkButton(
+            controls,
+            text="EXPORT LOG",
+            command=self.export_log,
+            fg_color="#263238",
+            text_color=self.colors.text,
+            hover_color="#33424a",
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=140,
+            height=36,
+        )
+        export_button.pack(side="left", padx=(0, 10))
+
         help_button = ctk.CTkButton(
             controls,
             text="HELP",
@@ -1232,6 +1245,30 @@ class FridayGUI:
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
         self.log("Log cleared")
+
+    def export_log(self):
+        try:
+            self.log_text.configure(state="normal")
+            content = self.log_text.get("1.0", "end").strip()
+            self.log_text.configure(state="disabled")
+        except Exception:
+            content = ""
+
+        if not content:
+            messagebox.showinfo("Empty log", "There is no log content to export.")
+            return
+
+        logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(logs_dir, f"friday-{ts}.log")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.write("\n")
+            self.toast(f"Log exported: {path}", level="ok", ms=4500)
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
 
     def update_status(self, status: str, color: str | None = None):
         self.status_label.configure(text=status, text_color=(color or self.colors.ok))
