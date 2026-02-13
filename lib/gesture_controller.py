@@ -47,12 +47,17 @@ class GestureController:
             # Dependencies not available – no-op controller
             self._emit_status("Gesture controller disabled (missing cv2/mediapipe).")
             return
+        if not hasattr(mp, "solutions"):
+            self._emit_status(
+                "Gesture controller disabled (this MediaPipe build has no mp.solutions)."
+            )
+            return
 
         if start_immediately:
             self.start()
 
     def start(self):
-        if not cv2 or not mp:
+        if not cv2 or not mp or not hasattr(mp, "solutions"):
             return
         if self._thread and self._thread.is_alive():
             return
@@ -102,7 +107,7 @@ class GestureController:
             pass
 
     def _run(self):
-        if not cv2 or not mp:
+        if not cv2 or not mp or not hasattr(mp, "solutions"):
             return
 
         cap = cv2.VideoCapture(int(self.camera_index))

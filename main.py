@@ -93,6 +93,12 @@ try:
 except Exception:
     psutil = None
 
+try:
+    from PIL import Image, ImageTk  # type: ignore
+except Exception:
+    Image = None  # type: ignore[assignment]
+    ImageTk = None  # type: ignore[assignment]
+
 
 @dataclass(frozen=True)
 class FridayColors:
@@ -154,11 +160,18 @@ class FridayGUI:
         self._last_download_path: str | None = None
         self.limited_mode = False
         self.command_processor_error: str | None = None
-        self._config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        self._config_base_path = os.path.join(os.path.dirname(__file__), "config.json")
+        self._config_user_path = os.path.join(os.path.dirname(__file__), "config.user.json")
         self._config = self._load_config()
         self._pending_config_write = False
         self._cmd_history: list[str] = []
         self._cmd_history_idx: int | None = None
+        self._camera_preview_stop = threading.Event()
+        self._camera_preview_thread: threading.Thread | None = None
+        self._camera_preview_cap = None
+        self._camera_preview_lock = threading.Lock()
+        self._camera_preview_pil = None
+        self._camera_preview_photo = None
 
         self.voice_engine = VoiceEngine()
         try:
@@ -192,12 +205,35 @@ class FridayGUI:
         self.root.after(400, self._startup_greeting)
 
     def _load_config(self) -> dict:
+        def deep_merge(a: dict, b: dict) -> dict:
+            out = dict(a)
+            for k, v in b.items():
+                if isinstance(v, dict) and isinstance(out.get(k), dict):
+                    out[k] = deep_merge(out[k], v)
+                else:
+                    out[k] = v
+            return out
+
+        base = {}
+        user = {}
         try:
-            with open(self._config_path, "r", encoding="utf-8") as f:
+            with open(self._config_base_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
+                if isinstance(data, dict):
+                    base = data
         except Exception:
-            return {}
+            base = {}
+
+        try:
+            if os.path.exists(self._config_user_path):
+                with open(self._config_user_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        user = data
+        except Exception:
+            user = {}
+
+        return deep_merge(base, user)
 
     def _get_config(self, *path, default=None):
         node = self._config
@@ -226,11 +262,11 @@ class FridayGUI:
     def _write_config_now(self):
         self._pending_config_write = False
         try:
-            tmp = f"{self._config_path}.tmp"
+            tmp = f"{self._config_user_path}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._config, f, indent=2, ensure_ascii=False)
                 f.write("\n")
-            os.replace(tmp, self._config_path)
+            os.replace(tmp, self._config_user_path)
             self.log("Config saved.")
         except Exception as e:
             self.log(f"Config save failed: {e}")
@@ -769,6 +805,7 @@ class FridayGUI:
         except Exception:
             cfg_cam = 0
         self.camera_index_var = ctk.IntVar(value=cfg_cam)
+        self.camera_index_str = ctk.StringVar(value=str(cfg_cam))
 
         ctk.CTkLabel(
             row,
@@ -780,7 +817,7 @@ class FridayGUI:
         idx_menu = ctk.CTkOptionMenu(
             row,
             values=["0", "1", "2", "3"],
-            variable=ctk.StringVar(value=str(cfg_cam)),
+            variable=self.camera_index_str,
             command=lambda v: self._on_camera_index_changed(v),
             fg_color="#1b2735",
             button_color="#1b2735",
@@ -806,6 +843,33 @@ class FridayGUI:
             height=34,
         )
         test_btn.pack(side="left", padx=(14, 0))
+
+        self.preview_start_btn = ctk.CTkButton(
+            row,
+            text="PREVIEW",
+            command=self.start_camera_preview,
+            fg_color=self.colors.accent,
+            hover_color="#29f2ff",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=130,
+            height=34,
+        )
+        self.preview_start_btn.pack(side="left", padx=(14, 0))
+
+        self.preview_stop_btn = ctk.CTkButton(
+            row,
+            text="STOP PREVIEW",
+            command=self.stop_camera_preview,
+            fg_color="#1b2735",
+            hover_color="#24384e",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=150,
+            height=34,
+            state="disabled",
+        )
+        self.preview_stop_btn.pack(side="left", padx=(10, 0))
 
         self.gesture_start_btn = ctk.CTkButton(
             row,
@@ -858,6 +922,27 @@ class FridayGUI:
             deps.append("MediaPipe missing.")
         if deps:
             self._gesture_status.set("Gestures: unavailable — " + " ".join(deps))
+
+        preview_card = ctk.CTkFrame(parent, fg_color=self.colors.bg, corner_radius=12)
+        preview_card.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        ctk.CTkLabel(
+            preview_card,
+            text="Camera Preview",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        self.camera_preview_label = ctk.CTkLabel(
+            preview_card,
+            text="Preview is stopped.",
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            width=900,
+            height=420,
+        )
+        self.camera_preview_label.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self._camera_preview_ui_tick()
 
     def _refresh_system_tab(self):
         lines = []
@@ -931,6 +1016,10 @@ class FridayGUI:
         except Exception:
             idx = 0
         self.camera_index_var.set(idx)
+        try:
+            self.camera_index_str.set(str(idx))
+        except Exception:
+            pass
         self._set_config("customization", "camera_index", value=idx)
         self._schedule_config_write()
         self._gesture_status.set(f"Gestures: camera set to {idx}")
@@ -969,6 +1058,15 @@ class FridayGUI:
         if GestureController is None:
             self.toast("Gesture controller unavailable (missing deps).", level="error")
             return
+        try:
+            import mediapipe as mp  # type: ignore
+
+            if not hasattr(mp, "solutions"):
+                self.toast("MediaPipe has no mp.solutions on this Python build.", level="error", ms=4500)
+                self._gesture_set_status("disabled (mp.solutions missing)")
+                return
+        except Exception:
+            pass
 
         idx = int(getattr(self, "camera_index_var", ctk.IntVar(value=0)).get())
 
@@ -1015,6 +1113,93 @@ class FridayGUI:
             pass
         self.toast("Gesture control stopped.", level="ok")
         self._gesture_set_status("stopped")
+
+    def start_camera_preview(self):
+        if Image is None or ImageTk is None:
+            self.toast("Pillow missing; camera preview unavailable.", level="error")
+            return
+        try:
+            import cv2  # type: ignore
+        except Exception as e:
+            self.toast(f"OpenCV missing: {e}", level="error", ms=4500)
+            return
+
+        if self._camera_preview_thread and self._camera_preview_thread.is_alive():
+            return
+
+        # Avoid camera contention with gestures.
+        if self.gesture_controller:
+            self.stop_gestures()
+
+        idx = int(getattr(self, "camera_index_var", ctk.IntVar(value=0)).get())
+        self._camera_preview_stop.clear()
+
+        def worker():
+            cap = cv2.VideoCapture(idx)
+            if not cap.isOpened():
+                self.root.after(0, lambda: self.toast(f"Camera {idx} failed to open.", level="error"))
+                return
+            self._camera_preview_cap = cap
+            try:
+                while not self._camera_preview_stop.is_set():
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    frame = cv2.flip(frame, 1)
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img = Image.fromarray(rgb)
+                    img = img.resize((960, 540))
+                    with self._camera_preview_lock:
+                        self._camera_preview_pil = img
+                    time.sleep(0.02)
+            finally:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                self._camera_preview_cap = None
+
+        self._camera_preview_thread = threading.Thread(target=worker, daemon=True)
+        self._camera_preview_thread.start()
+        try:
+            self.preview_start_btn.configure(state="disabled")
+            self.preview_stop_btn.configure(state="normal")
+        except Exception:
+            pass
+        self.toast("Camera preview started.", level="ok")
+
+    def stop_camera_preview(self):
+        self._camera_preview_stop.set()
+        try:
+            if self._camera_preview_thread and self._camera_preview_thread.is_alive():
+                self._camera_preview_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        self._camera_preview_thread = None
+        with self._camera_preview_lock:
+            self._camera_preview_pil = None
+        try:
+            self.camera_preview_label.configure(image=None, text="Preview is stopped.")
+        except Exception:
+            pass
+        try:
+            self.preview_start_btn.configure(state="normal")
+            self.preview_stop_btn.configure(state="disabled")
+        except Exception:
+            pass
+        self.toast("Camera preview stopped.", level="ok")
+
+    def _camera_preview_ui_tick(self):
+        try:
+            img = None
+            with self._camera_preview_lock:
+                img = self._camera_preview_pil
+            if img is not None and ImageTk is not None:
+                self._camera_preview_photo = ImageTk.PhotoImage(img)
+                self.camera_preview_label.configure(image=self._camera_preview_photo, text="")
+        except Exception:
+            pass
+        self.root.after(60, self._camera_preview_ui_tick)
 
     def _build_youtube_tab(self, parent):
         top = ctk.CTkFrame(parent, fg_color="transparent")
