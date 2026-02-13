@@ -94,6 +94,11 @@ except Exception:
     psutil = None
 
 try:
+    import pyautogui  # type: ignore
+except Exception:
+    pyautogui = None
+
+try:
     from PIL import Image  # type: ignore
 except Exception:
     Image = None  # type: ignore[assignment]
@@ -175,6 +180,11 @@ class FridayGUI:
         self._gesture_model_path = os.path.join(
             os.path.dirname(__file__), "models", "hand_landmarker.task"
         )
+        self._mouse_control_enabled = ctk.BooleanVar(value=False)
+        self._window_move_enabled = ctk.BooleanVar(value=False)
+        self._close_window_enabled = ctk.BooleanVar(value=False)
+        self._mouse_smooth = {"x": None, "y": None}
+        self._window_drag = {"active": False, "win": None, "dx": 0, "dy": 0}
 
         self.voice_engine = VoiceEngine()
         try:
@@ -875,6 +885,42 @@ class FridayGUI:
         )
         self.preview_stop_btn.pack(side="left", padx=(10, 0))
 
+        toggles = ctk.CTkFrame(card, fg_color="transparent")
+        toggles.pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkSwitch(
+            toggles,
+            text="MOUSE (1 finger)",
+            variable=self._mouse_control_enabled,
+            command=self._on_mouse_control_toggle,
+            fg_color="#1b2735",
+            progress_color=self.colors.accent,
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).pack(side="left", padx=(0, 12))
+
+        ctk.CTkSwitch(
+            toggles,
+            text="MOVE WINDOW (4)",
+            variable=self._window_move_enabled,
+            command=self._on_window_move_toggle,
+            fg_color="#1b2735",
+            progress_color=self.colors.accent,
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).pack(side="left", padx=(0, 12))
+
+        ctk.CTkSwitch(
+            toggles,
+            text="CLOSE WINDOW (5)",
+            variable=self._close_window_enabled,
+            command=self._on_close_window_toggle,
+            fg_color="#1b2735",
+            progress_color=self.colors.accent,
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).pack(side="left")
+
         self.gesture_start_btn = ctk.CTkButton(
             row,
             text="START",
@@ -1088,6 +1134,131 @@ class FridayGUI:
         except Exception:
             pass
 
+    def _on_mouse_control_toggle(self):
+        if bool(self._mouse_control_enabled.get()):
+            if pyautogui is None:
+                self._mouse_control_enabled.set(False)
+                self.toast("pyautogui missing; mouse control unavailable.", level="error", ms=4500)
+                return
+            self.toast("Mouse control enabled (1 finger).", level="ok")
+        else:
+            self._mouse_smooth = {"x": None, "y": None}
+            self.toast("Mouse control disabled.", level="ok")
+
+    def _on_window_move_toggle(self):
+        if bool(self._window_move_enabled.get()):
+            if gw is None:
+                self._window_move_enabled.set(False)
+                self.toast("pygetwindow missing; window move unavailable.", level="error", ms=4500)
+                return
+            self.toast("Window move enabled (4 fingers).", level="ok")
+        else:
+            self._window_drag = {"active": False, "win": None, "dx": 0, "dy": 0}
+            self.toast("Window move disabled.", level="ok")
+
+    def _on_close_window_toggle(self):
+        if bool(self._close_window_enabled.get()):
+            self.toast("Close window enabled (5 fingers).", level="ok")
+        else:
+            self.toast("Close window disabled.", level="ok")
+
+    def _mouse_move_from_norm(self, x: float, y: float):
+        if pyautogui is None:
+            return
+        try:
+            w, h = pyautogui.size()
+            tx = max(0, min(int(x * w), w - 1))
+            ty = max(0, min(int(y * h), h - 1))
+            # basic smoothing
+            lx = self._mouse_smooth["x"]
+            ly = self._mouse_smooth["y"]
+            if lx is None or ly is None:
+                sx, sy = tx, ty
+            else:
+                alpha = 0.35
+                sx = int(lx + (tx - lx) * alpha)
+                sy = int(ly + (ty - ly) * alpha)
+            self._mouse_smooth["x"] = sx
+            self._mouse_smooth["y"] = sy
+            pyautogui.moveTo(sx, sy, duration=0)
+        except Exception:
+            pass
+
+    def _window_drag_start(self, x: float, y: float):
+        if gw is None:
+            return
+        try:
+            win = gw.getActiveWindow()
+        except Exception:
+            win = None
+        if not win:
+            return
+        try:
+            if pyautogui is None:
+                return
+            sw, sh = pyautogui.size()
+            px = int(x * sw)
+            py = int(y * sh)
+            # Offset cursor->window top-left so it "sticks"
+            self._window_drag = {"active": True, "win": win, "dx": px - win.left, "dy": py - win.top}
+            self._set_last_gesture("window drag start")
+        except Exception:
+            self._window_drag = {"active": False, "win": None, "dx": 0, "dy": 0}
+
+    def _window_drag_update(self, x: float, y: float):
+        if not self._window_drag.get("active"):
+            return
+        win = self._window_drag.get("win")
+        if not win or pyautogui is None:
+            return
+        try:
+            sw, sh = pyautogui.size()
+            px = int(x * sw)
+            py = int(y * sh)
+            nx = px - int(self._window_drag.get("dx", 0))
+            ny = py - int(self._window_drag.get("dy", 0))
+            win.moveTo(nx, ny)
+        except Exception:
+            pass
+
+    def _window_drag_stop(self):
+        if self._window_drag.get("active"):
+            self._window_drag = {"active": False, "win": None, "dx": 0, "dy": 0}
+            self._set_last_gesture("window drag stop")
+
+    def _close_active_window(self):
+        if not bool(self._close_window_enabled.get()):
+            return
+        try:
+            if gw is not None:
+                win = gw.getActiveWindow()
+                if win:
+                    try:
+                        win.close()
+                        return
+                    except Exception:
+                        pass
+            if pyautogui is not None:
+                pyautogui.hotkey("alt", "f4")
+        except Exception:
+            pass
+
+    def _gesture_click(self):
+        if pyautogui is None:
+            self.toast("pyautogui missing; click unavailable.", level="error")
+            return
+        try:
+            pyautogui.click()
+            self.toast("Click.", level="ok", ms=900)
+        except Exception:
+            pass
+
+    def _gesture_open_palm_action(self):
+        # Open palm maps to either 4 (move window via pointer updates) or 5 (close window),
+        # but the controller only guarantees >=4 here. Use close if enabled and drag is not active.
+        if bool(self._close_window_enabled.get()):
+            self._close_active_window()
+
     def test_camera(self):
         try:
             import cv2  # type: ignore
@@ -1151,12 +1322,18 @@ class FridayGUI:
             self._gesture_set_status(msg)
             self.log(f"Gesture status: {msg}")
 
-        def on_detection(fingers: int):
+        def on_detection(fingers: int, pointer):
             try:
-                if fingers >= 3:
-                    self._set_last_gesture(f"{fingers} fingers (listen)")
+                if fingers == 1:
+                    self._set_last_gesture("1 finger (mouse)")
                 elif fingers == 2:
-                    self._set_last_gesture("2 fingers (camera tab)")
+                    self._set_last_gesture("2 fingers (tap=click / hold=camera)")
+                elif fingers == 3:
+                    self._set_last_gesture("3 fingers (listen)")
+                elif fingers == 4:
+                    self._set_last_gesture("4 fingers (move window)")
+                elif fingers >= 5:
+                    self._set_last_gesture("5 fingers (close window)")
                 elif fingers == 0:
                     self._set_last_gesture("fist (stop)")
                 else:
@@ -1164,21 +1341,35 @@ class FridayGUI:
             except Exception:
                 pass
 
+            try:
+                if not pointer:
+                    # stop drag if we lost tracking
+                    self._window_drag_stop()
+                    return
+                x, y = pointer
+                if fingers == 1 and bool(self._mouse_control_enabled.get()):
+                    self._mouse_move_from_norm(x, y)
+                if fingers == 4 and bool(self._window_move_enabled.get()):
+                    if not self._window_drag.get("active"):
+                        self._window_drag_start(x, y)
+                    self._window_drag_update(x, y)
+                else:
+                    self._window_drag_stop()
+            except Exception:
+                pass
+
         try:
             self.gesture_controller = GestureController(
-                on_open_hand=lambda: self.root.after(
-                    0, lambda: (self._set_last_gesture("open hand"), self.start_listening())
-                ),
-                on_two_fingers=lambda: self.root.after(
-                    0, lambda: (self._set_last_gesture("two fingers"), self._open_camera_tab())
-                ),
-                on_closed_fist=lambda: self.root.after(
-                    0, lambda: (self._set_last_gesture("fist"), self.stop_listening())
-                ),
-                on_detection=lambda f: self.root.after(0, lambda: on_detection(f)),
+                on_open_hand=lambda: self.root.after(0, self.start_listening),
+                on_closed_fist=lambda: self.root.after(0, self.stop_listening),
+                on_two_fingers_hold=lambda: self.root.after(0, self._open_camera_tab),
+                on_two_fingers_tap=lambda: self.root.after(0, self._gesture_click),
+                on_open_palm=lambda: self.root.after(0, self._gesture_open_palm_action),
+                on_detection=lambda f, p: self.root.after(0, lambda: on_detection(f, p)),
                 camera_index=idx,
                 start_immediately=True,
                 cooldown_s=1.2,
+                two_finger_hold_s=1.0,
                 on_status=on_status,
                 dispatcher=dispatch,
                 show_preview=False,

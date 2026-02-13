@@ -25,12 +25,17 @@ class GestureController:
         self,
         on_open_hand=None,
         on_closed_fist=None,
-        on_two_fingers=None,
-        on_detection=None,
+        on_two_fingers=None,  # backward-compat (treated like hold)
+        on_open_palm=None,
+        on_two_fingers_tap=None,
+        on_two_fingers_hold=None,
+        on_detection=None,  # (fingers_up, pointer_xy) -> None
+        on_pointer=None,  # (x_norm, y_norm) -> None
         *,
         camera_index: int = 0,
         start_immediately: bool = True,
         cooldown_s: float = 1.2,
+        two_finger_hold_s: float = 1.0,
         on_status=None,
         dispatcher=None,
         show_preview: bool = False,
@@ -39,9 +44,14 @@ class GestureController:
         self.on_open_hand = on_open_hand
         self.on_closed_fist = on_closed_fist
         self.on_two_fingers = on_two_fingers
+        self.on_open_palm = on_open_palm
+        self.on_two_fingers_tap = on_two_fingers_tap
+        self.on_two_fingers_hold = on_two_fingers_hold
         self.on_detection = on_detection
+        self.on_pointer = on_pointer
         self.camera_index = camera_index
         self.cooldown_s = max(0.0, float(cooldown_s))
+        self.two_finger_hold_s = max(0.1, float(two_finger_hold_s))
         self.on_status = on_status
         self.dispatcher = dispatcher
         self.show_preview = show_preview
@@ -169,6 +179,8 @@ class GestureController:
                 return
 
         last_action = 0.0
+        two_start = None
+        two_hold_fired = False
 
         try:
             while not self._stop.is_set():
@@ -181,10 +193,20 @@ class GestureController:
                 frame = cv2.flip(frame, 1)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 landmarks = None
+                handedness = None
                 if hands is not None:
                     result = hands.process(rgb)
                     if result.multi_hand_landmarks:
                         landmarks = result.multi_hand_landmarks[0].landmark
+                        try:
+                            if getattr(result, "multi_handedness", None):
+                                handedness = (
+                                    result.multi_handedness[0]
+                                    .classification[0]
+                                    .label
+                                )
+                        except Exception:
+                            handedness = None
                 elif landmarker is not None:
                     try:
                         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -192,31 +214,89 @@ class GestureController:
                         result = landmarker.detect_for_video(mp_image, ts_ms)
                         if getattr(result, "hand_landmarks", None):
                             landmarks = result.hand_landmarks[0]
+                        try:
+                            # Best-effort: Tasks API may expose handedness differently across versions.
+                            handed = getattr(result, "handedness", None) or getattr(result, "handednesses", None)
+                            if handed and handed[0] and handed[0][0]:
+                                handedness = getattr(handed[0][0], "category_name", None) or getattr(handed[0][0], "display_name", None)
+                        except Exception:
+                            handedness = None
                     except Exception:
                         landmarks = None
 
                 if landmarks:
-                    # Simple heuristic: count "extended" fingers based on y-position
-                    tip_ids = [4, 8, 12, 16, 20]  # (thumb tip unused)
+                    # Finger counting:
+                    # - Index/middle/ring/pinky: tip above PIP => extended
+                    # - Thumb: best-effort heuristic
+                    finger_tips = [8, 12, 16, 20]
+                    finger_pips = [6, 10, 14, 18]
                     fingers_up = 0
-                    # Use wrist as approximate palm reference
-                    wrist_y = landmarks[0].y
-                    for tid in tip_ids[1:]:  # ignore thumb for simplicity
-                        if landmarks[tid].y < wrist_y:  # above wrist -> extended
+
+                    for tip, pip in zip(finger_tips, finger_pips):
+                        if landmarks[tip].y < landmarks[pip].y:
                             fingers_up += 1
 
+                    thumb_extended = False
+                    try:
+                        # Use a magnitude check as a fallback when handedness is unknown.
+                        dx = abs(landmarks[4].x - landmarks[3].x)
+                        thumb_extended = dx > 0.04
+                        if handedness:
+                            h = str(handedness).lower()
+                            # With selfie-mirror flip, handedness may be unreliable; keep magnitude gate.
+                            if "right" in h:
+                                thumb_extended = thumb_extended and (landmarks[4].x < landmarks[3].x)
+                            elif "left" in h:
+                                thumb_extended = thumb_extended and (landmarks[4].x > landmarks[3].x)
+                    except Exception:
+                        thumb_extended = False
+
+                    if thumb_extended:
+                        fingers_up += 1
+
+                    pointer_xy = None
+                    try:
+                        pointer_xy = (float(landmarks[8].x), float(landmarks[8].y))
+                    except Exception:
+                        pointer_xy = None
+
+                    if pointer_xy and callable(self.on_pointer):
+                        self._dispatch(lambda p=pointer_xy: self.on_pointer(p[0], p[1]))
+
                     now = time.time()
+                    if callable(self.on_detection):
+                        self._dispatch(lambda f=fingers_up, p=pointer_xy: self.on_detection(f, p))
+
+                    # 2-finger tap vs hold (hold can be used for panel switching)
+                    if fingers_up == 2:
+                        if two_start is None:
+                            two_start = now
+                            two_hold_fired = False
+                        if not two_hold_fired and (now - two_start) >= self.two_finger_hold_s:
+                            two_hold_fired = True
+                            if callable(self.on_two_fingers_hold):
+                                self._dispatch(self.on_two_fingers_hold)
+                            elif callable(self.on_two_fingers):
+                                self._dispatch(self.on_two_fingers)
+                    else:
+                        if two_start is not None:
+                            duration = now - two_start
+                            if duration < self.two_finger_hold_s and callable(self.on_two_fingers_tap):
+                                self._dispatch(self.on_two_fingers_tap)
+                        two_start = None
+                        two_hold_fired = False
+
+                    # Cooldown-gated actions
                     if self.cooldown_s and (now - last_action) < self.cooldown_s:
                         pass
                     else:
-                        if callable(self.on_detection):
-                            self._dispatch(lambda f=fingers_up: self.on_detection(f))
-                        if fingers_up >= 3:
+                        if fingers_up == 3:
                             last_action = now
                             self._dispatch(self.on_open_hand)
-                        elif fingers_up == 2:
+                        elif fingers_up >= 4:
                             last_action = now
-                            self._dispatch(self.on_two_fingers)
+                            if callable(self.on_open_palm):
+                                self._dispatch(self.on_open_palm)
                         elif fingers_up == 0:
                             last_action = now
                             self._dispatch(self.on_closed_fist)
