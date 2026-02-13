@@ -1,439 +1,734 @@
 """
 Personal Voice Assistant
-A Python application using Tkinter GUI, PyAutoGUI, and voice recognition/synthesis
-without any API dependencies for core functionality.
-"""
-import os
-import ctypes
 
-# Optional window-management imports for Jarvis-style dashboard
+FRIDAY/JARVIS-inspired CustomTkinter UI + local voice control + a couple of
+practical automations:
+- Download a YouTube video/audio (via yt-dlp)
+- Move folders between locations
+"""
+
+from __future__ import annotations
+
+import ctypes
+import datetime
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from tkinter import filedialog, messagebox
+
+# Optional window-management imports for a Jarvis-style dashboard
 try:
     import pygetwindow as gw
 except Exception:
     gw = None
 
-# Suppress ALSA/JACK library warnings in the console
+# Suppress ALSA/JACK library warnings in the console (Linux)
 def py_error_handler(filename, line, function, err, fmt):
     pass
 
-ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
+
+ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.c_char_p,
+)
 c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
 
 try:
-    asound = ctypes.cdll.LoadLibrary('libasound.so.2')
+    asound = ctypes.cdll.LoadLibrary("libasound.so.2")
     asound.snd_lib_error_set_handler(c_error_handler)
-except:
+except Exception:
     pass
-from pydoc import text
-from email.mime import text
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
-import threading
-import datetime
-from lib.voice_engine import VoiceEngine
-from lib.command_processor import CommandProcessor
-from lib.gesture_controller import GestureController
-import os
-import time
-import sys
 
-# If you want to run without audio (CI/headless) set the env var:
+try:
+    import customtkinter as ctk
+except Exception:
+    ctk = None
+
+try:
+    from lib.voice_engine import VoiceEngine
+except Exception as e:
+    VoiceEngine = None  # type: ignore[assignment]
+    _voice_engine_import_error = e
+
+try:
+    from lib.command_processor import CommandProcessor
+except Exception as e:
+    CommandProcessor = None  # type: ignore[assignment]
+    _command_processor_import_error = e
+
+try:
+    from lib.gesture_controller import GestureController
+except Exception:
+    GestureController = None  # type: ignore[assignment]
+
+# If you want to run without audio (CI/headless) set:
 #   FRIDAY_HEADLESS=1  or FRIDAY_DISABLE_AUDIO_WARNINGS=1
-# This sets SDL to the dummy audio driver which prevents ALSA/JACK noise.
-_FRIDAY_HEADLESS = os.environ.get('FRIDAY_HEADLESS') == '1' or os.environ.get('FRIDAY_DISABLE_AUDIO_WARNINGS') == '1'
+_FRIDAY_HEADLESS = (
+    os.environ.get("FRIDAY_HEADLESS") == "1"
+    or os.environ.get("FRIDAY_DISABLE_AUDIO_WARNINGS") == "1"
+)
 if _FRIDAY_HEADLESS:
-    os.environ['SDL_AUDIODRIVER'] = 'dummy'
+    os.environ["SDL_AUDIODRIVER"] = "dummy"
 
-# Hide pygame support prompt. If running headless, redirect stderr to reduce C-level ALSA/JACK noise.
-os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = 'hide'
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "hide"
 _stderr_null = None
 if _FRIDAY_HEADLESS:
-    _stderr_null = open(os.devnull, 'w')
+    _stderr_null = open(os.devnull, "w")
     sys.stderr = _stderr_null
 
 import pygame
-class VoiceAssistantGUI:
-    """Main GUI application for the voice assistant."""
-    
-    def __init__(self, root):
-        self.root = root
+
+
+@dataclass(frozen=True)
+class FridayColors:
+    bg: str = "#050816"
+    panel: str = "#081229"
+    panel_2: str = "#0b1633"
+    accent: str = "#00e5ff"
+    accent_2: str = "#00ffae"
+    text: str = "#e0f7fa"
+    muted: str = "#93a4b8"
+    danger: str = "#ff1744"
+    ok: str = "#00c853"
+    warn: str = "#f39c12"
+
+
+class _FallbackCommandProcessor:
+    def __init__(self, voice_engine: object, import_error: Exception):
+        self.voice_engine = voice_engine
+        self.import_error = import_error
+
+    def process(self, command: str) -> bool:
+        return False
+
+
+class FridayGUI:
+    """FRIDAY-like desktop console using CustomTkinter."""
+
+    def __init__(self):
+        if ctk is None:
+            raise RuntimeError(
+                "customtkinter is not installed. Install it with: pip install customtkinter"
+            )
+        if VoiceEngine is None:
+            raise RuntimeError(
+                f"VoiceEngine failed to import: {_voice_engine_import_error}. "
+                "Install dependencies from requirements.txt."
+            )
+
+        self.colors = FridayColors()
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        self.root = ctk.CTk()
         self.root.title("FRIDAY // Neural Console")
-        self.root.geometry("1100x650")
-        # Jarvis/eDex-style dark background
-        self.root.configure(bg="#050816")
-        
-        # 1. Initialize engines
+        self.root.geometry("1200x720")
+        self.root.minsize(1100, 650)
+        self.root.configure(fg_color=self.colors.bg)
+
+        self.is_listening = False
+        self.is_hidden = False
+
+        self._window_handles: list[object] = []
+        self._download_thread: threading.Thread | None = None
+        self._move_thread: threading.Thread | None = None
+        self._voice_form: dict | None = None
+
         self.voice_engine = VoiceEngine()
-        # Try to initialize memory store for chatbot
         try:
             from lib.memory_store import FridayMemory
+
             memory_store = FridayMemory()
         except Exception:
             memory_store = None
-        self.command_processor = CommandProcessor(self.voice_engine, memory_store)
-        self.processor = self.command_processor 
-        # Optional: gesture controller (hand open = start, fist = stop)
-        try:
-            self.gesture_controller = GestureController(
-                on_open_hand=self.start_listening,
-                on_closed_fist=self.stop_listening
-            )
-        except Exception:
+
+        if CommandProcessor is None:
+            self.command_processor = _FallbackCommandProcessor(self.voice_engine, _command_processor_import_error)  # type: ignore[arg-type]
+        else:
+            self.command_processor = CommandProcessor(self.voice_engine, memory_store)
+
+        if GestureController is None:
             self.gesture_controller = None
-        
-        # 2. Build the UI
-        self.setup_gui()
-        
-        # 3. Startup Greeting Logic
-        # Give Kali/PipeWire 0.5s to stabilize the audio stream
-        import time
-        import random
-        time.sleep(0.5)
-        greetings = [
-            "Uhm, systems online, bro. I'm ready, Aime.",
-            "Alright dude, I'm online and ready!",
-            "Hey man, systems are up. What's good?",
-            "Bro, I'm ready to go!",
-        ]
-        self.voice_engine.speak(random.choice(greetings))
-        
-        self.is_listening = False
-        self.is_hidden = True 
-        
-        # 4. Start the background thread
-        threading.Thread(target=self.background_listener, daemon=True).start()
-        pygame.mixer.music.set_volume(1.0) # Ensure volume is at 100%
-    def background_listener(self):
-        print("Friday is synchronized and standing by...")
-        while True:
+        else:
             try:
-                # 1. Safety: Don't use mic if Friday is already talking
-                if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
-                    time.sleep(1)
-                    continue
+                self.gesture_controller = GestureController(
+                    on_open_hand=self.start_listening,
+                    on_closed_fist=self.stop_listening,
+                )
+            except Exception:
+                self.gesture_controller = None
 
-                # 2. Only run wake-word detection if UI is hidden
-                if self.is_hidden:
-                    # We use a shorter timeout to keep the loop responsive
-                    result = self.voice_engine.listen_offline(timeout=2)
-                    
-                    if result == "friday":
-                        print(">>> Wake word 'Friday' detected!")
-                        self.is_hidden = False 
-                        self.root.after(0, self.show_interface)
-            
-            except Exception as e:
-                # This prevents the thread from crashing if the mic glitches
-                print(f"Background Thread Warning: {e}")
-            
-            # 3. Prevent CPU spiking
-            time.sleep(0.4)
-    def show_interface(self):
-        """Bring Friday to the front and start listening."""
-        import random
-        self.is_hidden = False
-        self.root.deiconify() # Show window
-        self.root.attributes("-topmost", True) # Force to front
-        responses = [
-            "Uhm, yeah bro, what's up?",
-            "Dude, I'm here! What's going on?",
-            "Hey man, what can I do for you?",
-            "Bro, what's good?",
-        ]
-        self.voice_engine.speak(random.choice(responses))
-        self.start_listening()
-    def setup_gui(self):
-        """Set up the Tkinter GUI components."""
-        
-        # Header – holographic style bar
-        header_frame = tk.Frame(self.root, bg='#050816')
-        header_frame.pack(fill=tk.X, padx=0, pady=0)
+        self._build_ui()
 
-        # Left-side "orb" to feel like a tech assistant core
-        self.orb_canvas = tk.Canvas(
-            header_frame,
-            width=64,
-            height=64,
-            bg="#050816",
-            highlightthickness=0,
-            bd=0
+        try:
+            pygame.mixer.music.set_volume(1.0)
+        except Exception:
+            pass
+
+        threading.Thread(target=self.background_listener, daemon=True).start()
+        self.root.after(400, self._startup_greeting)
+
+    def _startup_greeting(self):
+        try:
+            import random
+
+            greetings = [
+                "FRIDAY online and standing by.",
+                "All systems are up. How can I help?",
+                "Systems online. I'm ready.",
+            ]
+            self.voice_engine.speak(random.choice(greetings))
+        except Exception:
+            pass
+
+    # ---------------------------
+    # UI
+    # ---------------------------
+    def _build_ui(self):
+        header = ctk.CTkFrame(self.root, fg_color=self.colors.bg, corner_radius=0)
+        header.pack(fill="x", padx=0, pady=0)
+
+        header_inner = ctk.CTkFrame(header, fg_color=self.colors.bg, corner_radius=0)
+        header_inner.pack(fill="x", padx=18, pady=(12, 6))
+
+        # CustomTkinter doesn't ship a canvas; use a Tk canvas inside a CTkFrame.
+        self.orb_canvas = self._tk_canvas(
+            header_inner, width=64, height=64, bg=self.colors.bg
         )
-        self.orb_canvas.pack(side=tk.LEFT, padx=20, pady=8)
+        self.orb_canvas.pack(side="left", padx=(0, 14), pady=0)
         self._init_orb_visual()
-        
-        title_label = tk.Label(
-            header_frame,
-            text="FRIDAY // Interactive OS Console",
-            font=('Consolas', 20, 'bold'),
-            bg='#050816',
-            fg='#00d9ff'
+
+        title = ctk.CTkLabel(
+            header_inner,
+            text="FRIDAY // INTERACTIVE CONSOLE",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=22, weight="bold"),
         )
-        title_label.pack(pady=15)
-        
-        # Control Frame
-        control_frame = tk.Frame(self.root, bg="#050816")
-        control_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        # Listen Button
-        self.listen_button = tk.Button(
-            control_frame,
+        title.pack(side="left", pady=0)
+
+        controls = ctk.CTkFrame(self.root, fg_color=self.colors.bg, corner_radius=0)
+        controls.pack(fill="x", padx=18, pady=(6, 10))
+
+        self.listen_button = ctk.CTkButton(
+            controls,
             text="▶ LISTEN",
             command=self.start_listening,
-            bg='#00c853',
-            fg='#050816',
-            font=('Consolas', 12, 'bold'),
-            padx=20,
-            pady=10,
-            relief=tk.FLAT,
-            cursor='hand2'
+            fg_color=self.colors.ok,
+            text_color=self.colors.bg,
+            hover_color="#1fe27a",
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            width=140,
+            height=36,
         )
-        self.listen_button.pack(side=tk.LEFT, padx=5)
-        
-        # Stop Button
-        self.stop_button = tk.Button(
-            control_frame,
+        self.listen_button.pack(side="left", padx=(0, 10))
+
+        self.stop_button = ctk.CTkButton(
+            controls,
             text="■ STOP",
             command=self.stop_listening,
-            bg='#ff1744',
-            fg='#050816',
-            font=('Consolas', 12, 'bold'),
-            padx=20,
-            pady=10,
-            relief=tk.FLAT,
-            cursor='hand2',
-            state=tk.DISABLED
+            fg_color=self.colors.danger,
+            text_color=self.colors.bg,
+            hover_color="#ff4a68",
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            width=140,
+            height=36,
+            state="disabled",
         )
-        self.stop_button.pack(side=tk.LEFT, padx=5)
-        
-        # Clear Button
-        clear_button = tk.Button(
-            control_frame,
+        self.stop_button.pack(side="left", padx=(0, 10))
+
+        clear_button = ctk.CTkButton(
+            controls,
             text="CLR LOG",
             command=self.clear_log,
-            bg='#263238',
-            fg='#e0f7fa',
-            font=('Consolas', 11, 'bold'),
-            padx=20,
-            pady=10,
-            relief=tk.FLAT,
-            cursor='hand2'
+            fg_color="#263238",
+            text_color=self.colors.text,
+            hover_color="#33424a",
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=120,
+            height=36,
         )
-        clear_button.pack(side=tk.LEFT, padx=5)
-        
-        # Help Button
-        help_button = tk.Button(
-            control_frame,
+        clear_button.pack(side="left", padx=(0, 10))
+
+        help_button = ctk.CTkButton(
+            controls,
             text="HELP",
             command=self.show_help,
-            bg='#2962ff',
-            fg='#e3f2fd',
-            font=('Consolas', 11, 'bold'),
-            padx=20,
-            pady=10,
-            relief=tk.FLAT,
-            cursor='hand2'
+            fg_color="#2962ff",
+            text_color="#e3f2fd",
+            hover_color="#4478ff",
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=100,
+            height=36,
         )
-        help_button.pack(side=tk.LEFT, padx=5)
-        
-        # XO Game Button
-        xo_button = tk.Button(
-            control_frame,
-            text="XO GAME",
-            command=self.start_xo_game,
-            bg='#7b1fa2',
-            fg='#e1bee7',
-            font=('Consolas', 11, 'bold'),
-            padx=20,
-            pady=10,
-            relief=tk.FLAT,
-            cursor='hand2'
-        )
-        xo_button.pack(side=tk.LEFT, padx=5)
-        
-        # Chatbot Mode Button
-        self.chatbot_button = tk.Button(
-            control_frame,
-            text="💬 CHATBOT",
+        help_button.pack(side="left", padx=(0, 10))
+
+        self._chatbot_var = ctk.BooleanVar(value=False)
+        self.chatbot_switch = ctk.CTkSwitch(
+            controls,
+            text="CHATBOT",
+            variable=self._chatbot_var,
             command=self.toggle_chatbot,
-            bg='#00bcd4',
-            fg='#050816',
-            font=('Consolas', 11, 'bold'),
-            padx=20,
-            pady=10,
-            relief=tk.FLAT,
-            cursor='hand2'
+            fg_color="#1b2735",
+            progress_color=self.colors.accent,
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
         )
-        self.chatbot_button.pack(side=tk.LEFT, padx=5)
-        
-        # Settings Frame
-        settings_frame = ttk.LabelFrame(self.root, text="AUDIO / VOICE CONTROL", padding=10)
-        settings_frame.pack(fill=tk.X, padx=20, pady=8)
-        
-        # Voice Speed
-        speed_label = tk.Label(settings_frame, text="Voice Speed", font=('Consolas', 9))
-        speed_label.pack(side=tk.LEFT, padx=5)
-        
-        self.speed_var = tk.IntVar(value=150)
-        speed_scale = ttk.Scale(
-            settings_frame,
+        self.chatbot_switch.pack(side="left", padx=(8, 10))
+
+        voice_panel = ctk.CTkFrame(self.root, fg_color=self.colors.panel, corner_radius=12)
+        voice_panel.pack(fill="x", padx=18, pady=(0, 10))
+
+        voice_title = ctk.CTkLabel(
+            voice_panel,
+            text="AUDIO / VOICE CONTROL",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        )
+        voice_title.pack(anchor="w", padx=12, pady=(10, 2))
+
+        sliders = ctk.CTkFrame(voice_panel, fg_color="transparent")
+        sliders.pack(fill="x", padx=12, pady=(4, 10))
+
+        self.speed_var = ctk.IntVar(value=150)
+        ctk.CTkLabel(
+            sliders,
+            text="Voice Speed",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=10),
+        ).pack(side="left", padx=(0, 8))
+        self.speed_scale = ctk.CTkSlider(
+            sliders,
             from_=50,
             to=300,
-            orient=tk.HORIZONTAL,
+            number_of_steps=250,
             variable=self.speed_var,
-            command=self.update_voice_settings
+            command=lambda _: self.update_voice_settings(),
         )
-        speed_scale.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        
-        # Volume
-        volume_label = tk.Label(settings_frame, text="Volume", font=('Consolas', 9))
-        volume_label.pack(side=tk.LEFT, padx=5)
-        
-        self.volume_var = tk.DoubleVar(value=0.9)
-        volume_scale = ttk.Scale(
-            settings_frame,
+        self.speed_scale.pack(side="left", fill="x", expand=True, padx=(0, 18))
+
+        self.volume_var = ctk.DoubleVar(value=0.9)
+        ctk.CTkLabel(
+            sliders,
+            text="Volume",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=10),
+        ).pack(side="left", padx=(0, 8))
+        self.volume_scale = ctk.CTkSlider(
+            sliders,
             from_=0.0,
             to=1.0,
-            orient=tk.HORIZONTAL,
+            number_of_steps=100,
             variable=self.volume_var,
-            command=self.update_voice_settings
+            command=lambda _: self.update_voice_settings(),
         )
-        volume_scale.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        
-        # Main content split: left = console, right = active windows
-        main_frame = tk.Frame(self.root, bg="#050816")
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        self.volume_scale.pack(side="left", fill="x", expand=True)
 
-        left_frame = tk.Frame(main_frame, bg="#050816")
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        body = ctk.CTkFrame(self.root, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=18, pady=(0, 10))
 
-        right_frame = tk.Frame(main_frame, bg="#050816", width=260)
-        right_frame.pack(side=tk.RIGHT, fill=tk.Y)
-        right_frame.pack_propagate(False)
+        left = ctk.CTkFrame(body, fg_color="transparent")
+        left.pack(side="left", fill="both", expand=True, padx=(0, 12))
 
-        # Output Log (left)
-        log_frame = ttk.LabelFrame(left_frame, text="SYSTEM BUS / EVENT STREAM", padding=10)
-        log_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.log_text = scrolledtext.ScrolledText(
-            log_frame,
-            height=15,
-            font=('Consolas', 10),
-            bg='#050816',
-            fg='#00ffae',
-            state=tk.DISABLED
+        right = ctk.CTkFrame(body, fg_color=self.colors.panel, corner_radius=12, width=280)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        self.tabs = ctk.CTkTabview(
+            left,
+            fg_color=self.colors.panel,
+            segmented_button_fg_color=self.colors.panel_2,
+            segmented_button_selected_color=self.colors.accent,
+            segmented_button_selected_hover_color=self.colors.accent,
+            segmented_button_unselected_color=self.colors.panel_2,
         )
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        
-        # Status Bar
-        status_frame = tk.Frame(self.root, bg='#050816', height=30)
-        status_frame.pack(fill=tk.X, side=tk.BOTTOM)
-        
-        self.status_label = tk.Label(
-            status_frame,
+        self.tabs.pack(fill="both", expand=True)
+
+        self.tab_console = self.tabs.add("Console")
+        self.tab_youtube = self.tabs.add("YouTube")
+        self.tab_files = self.tabs.add("Files")
+
+        self._build_console_tab(self.tab_console)
+        self._build_youtube_tab(self.tab_youtube)
+        self._build_files_tab(self.tab_files)
+        self._build_windows_panel(right)
+
+        status = ctk.CTkFrame(self.root, fg_color=self.colors.bg, corner_radius=0)
+        status.pack(fill="x", side="bottom")
+        self.status_label = ctk.CTkLabel(
+            status,
             text="Ready",
-            font=('Consolas', 10),
-            bg='#050816',
-            fg='#00e676',
-            anchor=tk.W,
-            padx=10
+            text_color=self.colors.ok,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
         )
-        self.status_label.pack(fill=tk.X, padx=10, pady=5)
-        # Typed command input (left column, under log)
-        self.command_entry = tk.Entry(left_frame, font=("Consolas", 11), bg="#000814", fg="#e0f7fa", insertbackground="#00e5ff")
-        self.command_entry.pack(pady=(8, 4), fill='x')
-        
-        self.send_button = tk.Button(left_frame, text="EXECUTE", command=self.handle_text_command,
-                                     bg="#1b2735", fg="#e0f7fa", font=("Consolas", 10, "bold"), relief=tk.FLAT)
-        self.send_button.pack(pady=(0, 4), anchor="e")
+        self.status_label.pack(anchor="w", padx=18, pady=(6, 10))
 
-        # Right column: live window / app overview
-        sidebar_label = tk.Label(
-            right_frame,
-            text="ACTIVE WINDOWS",
-            font=("Consolas", 10, "bold"),
-            bg="#050816",
-            fg="#00e5ff",
-            anchor="w"
-        )
-        sidebar_label.pack(fill=tk.X, pady=(0, 4))
+        self.root.bind("<space>", lambda e: self.start_listening())
+        self.root.bind("<Escape>", lambda e: self.stop_listening())
 
-        sidebar_frame = tk.Frame(right_frame, bg="#050816")
-        sidebar_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.window_listbox = tk.Listbox(
-            sidebar_frame,
-            font=("Consolas", 9),
-            bg="#000814",
-            fg="#e0f7fa",
-            selectbackground="#00bfa5",
-            activestyle="none"
-        )
-        self.window_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        scrollbar = tk.Scrollbar(sidebar_frame, orient=tk.VERTICAL, command=self.window_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.window_listbox.config(yscrollcommand=scrollbar.set)
-
-        self.window_listbox.bind("<Double-Button-1>", self.on_window_activate)
-        self._window_handles = []
-
-        # Add these where you define your buttons or window properties
-        self.root.bind('<space>', lambda e: self.start_listening())
-        self.root.bind('<Escape>', lambda e: self.stop_listening())
-        # Bind the 'Enter' key to the send function for speed
-        self.command_entry.bind('<Return>', lambda event: self.handle_text_command())
-
-        # Kick off periodic refresh of active window list
         self.refresh_window_list()
 
+    def _build_console_tab(self, parent):
+        ctk.CTkLabel(
+            parent,
+            text="SYSTEM BUS / EVENT STREAM",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        self.log_text = ctk.CTkTextbox(
+            parent,
+            fg_color=self.colors.bg,
+            text_color=self.colors.accent_2,
+            font=("Consolas", 11),
+            corner_radius=10,
+        )
+        self.log_text.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        self.log_text.configure(state="disabled")
+
+        cmd_row = ctk.CTkFrame(parent, fg_color="transparent")
+        cmd_row.pack(fill="x", padx=12, pady=(0, 12))
+
+        self.command_entry = ctk.CTkEntry(
+            cmd_row,
+            placeholder_text='Type a command… (try: download <url> or move "src" "dst")',
+            fg_color="#000814",
+            text_color=self.colors.text,
+            placeholder_text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            height=36,
+        )
+        self.command_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.command_entry.bind("<Return>", lambda e: self.handle_text_command())
+
+        self.send_button = ctk.CTkButton(
+            cmd_row,
+            text="EXECUTE",
+            command=self.handle_text_command,
+            fg_color="#1b2735",
+            hover_color="#24384e",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=120,
+            height=36,
+        )
+        self.send_button.pack(side="right")
+
+    def _build_youtube_tab(self, parent):
+        top = ctk.CTkFrame(parent, fg_color="transparent")
+        top.pack(fill="x", padx=12, pady=(12, 8))
+
+        ctk.CTkLabel(
+            top,
+            text="YouTube Downloader",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+        ).pack(anchor="w")
+
+        note = (
+            "Note: Only download content you own or have permission to download.\n"
+            "Some sites' Terms of Service may restrict downloading."
+        )
+        ctk.CTkLabel(
+            top,
+            text=note,
+            text_color=self.colors.muted,
+            justify="left",
+            font=ctk.CTkFont(family="Consolas", size=10),
+        ).pack(anchor="w", pady=(4, 0))
+
+        form = ctk.CTkFrame(parent, fg_color="transparent")
+        form.pack(fill="x", padx=12, pady=(4, 6))
+
+        self.yt_url = ctk.StringVar(value="")
+        self.yt_out_dir = ctk.StringVar(
+            value=os.path.join(os.path.expanduser("~"), "Downloads")
+        )
+        self.yt_mode = ctk.StringVar(value="Video (best)")
+
+        ctk.CTkLabel(
+            form,
+            text="URL",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.yt_url_entry = ctk.CTkEntry(
+            form,
+            textvariable=self.yt_url,
+            fg_color="#000814",
+            text_color=self.colors.text,
+            placeholder_text="https://www.youtube.com/watch?v=…",
+            font=ctk.CTkFont(family="Consolas", size=12),
+            height=34,
+        )
+        self.yt_url_entry.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=(0, 6))
+
+        ctk.CTkLabel(
+            form,
+            text="Save to",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).grid(row=1, column=0, sticky="w", pady=(0, 6))
+        out_entry = ctk.CTkEntry(
+            form,
+            textvariable=self.yt_out_dir,
+            fg_color="#000814",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            height=34,
+        )
+        out_entry.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(0, 6))
+
+        browse = ctk.CTkButton(
+            form,
+            text="Browse",
+            command=self._browse_youtube_out_dir,
+            fg_color="#1b2735",
+            hover_color="#24384e",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=110,
+            height=34,
+        )
+        browse.grid(row=1, column=2, padx=(10, 0), pady=(0, 6))
+
+        ctk.CTkLabel(
+            form,
+            text="Mode",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        mode = ctk.CTkOptionMenu(
+            form,
+            values=["Video (best)", "Video (mp4)", "Audio (mp3)"],
+            variable=self.yt_mode,
+            fg_color="#1b2735",
+            button_color="#1b2735",
+            button_hover_color="#24384e",
+            dropdown_fg_color="#0b1633",
+            dropdown_text_color=self.colors.text,
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            height=34,
+        )
+        mode.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(0, 6))
+
+        form.grid_columnconfigure(1, weight=1)
+
+        actions = ctk.CTkFrame(parent, fg_color="transparent")
+        actions.pack(fill="x", padx=12, pady=(6, 12))
+
+        self.yt_download_button = ctk.CTkButton(
+            actions,
+            text="DOWNLOAD",
+            command=self.download_youtube_from_ui,
+            fg_color=self.colors.accent,
+            hover_color="#29f2ff",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            width=160,
+            height=38,
+        )
+        self.yt_download_button.pack(side="left")
+
+        self.yt_open_folder_button = ctk.CTkButton(
+            actions,
+            text="OPEN FOLDER",
+            command=self._open_youtube_out_dir,
+            fg_color="#1b2735",
+            hover_color="#24384e",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=160,
+            height=38,
+        )
+        self.yt_open_folder_button.pack(side="left", padx=(10, 0))
+
+    def _build_files_tab(self, parent):
+        top = ctk.CTkFrame(parent, fg_color="transparent")
+        top.pack(fill="x", padx=12, pady=(12, 8))
+
+        ctk.CTkLabel(
+            top,
+            text="Folder Mover",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+        ).pack(anchor="w")
+
+        self.move_src = ctk.StringVar(value="")
+        self.move_dst = ctk.StringVar(value="")
+        self.move_on_conflict = ctk.StringVar(value="Rename")
+
+        form = ctk.CTkFrame(parent, fg_color="transparent")
+        form.pack(fill="x", padx=12, pady=(4, 6))
+
+        ctk.CTkLabel(
+            form,
+            text="Source folder",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        src_entry = ctk.CTkEntry(
+            form,
+            textvariable=self.move_src,
+            fg_color="#000814",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            height=34,
+        )
+        src_entry.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=(0, 6))
+        src_browse = ctk.CTkButton(
+            form,
+            text="Browse",
+            command=self._browse_move_src,
+            fg_color="#1b2735",
+            hover_color="#24384e",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=110,
+            height=34,
+        )
+        src_browse.grid(row=0, column=2, padx=(10, 0), pady=(0, 6))
+
+        ctk.CTkLabel(
+            form,
+            text="Destination folder",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).grid(row=1, column=0, sticky="w", pady=(0, 6))
+        dst_entry = ctk.CTkEntry(
+            form,
+            textvariable=self.move_dst,
+            fg_color="#000814",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            height=34,
+        )
+        dst_entry.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(0, 6))
+        dst_browse = ctk.CTkButton(
+            form,
+            text="Browse",
+            command=self._browse_move_dst,
+            fg_color="#1b2735",
+            hover_color="#24384e",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=110,
+            height=34,
+        )
+        dst_browse.grid(row=1, column=2, padx=(10, 0), pady=(0, 6))
+
+        ctk.CTkLabel(
+            form,
+            text="If destination exists",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        conflict = ctk.CTkOptionMenu(
+            form,
+            values=["Rename", "Fail"],
+            variable=self.move_on_conflict,
+            fg_color="#1b2735",
+            button_color="#1b2735",
+            button_hover_color="#24384e",
+            dropdown_fg_color="#0b1633",
+            dropdown_text_color=self.colors.text,
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            height=34,
+        )
+        conflict.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(0, 6))
+
+        form.grid_columnconfigure(1, weight=1)
+
+        actions = ctk.CTkFrame(parent, fg_color="transparent")
+        actions.pack(fill="x", padx=12, pady=(6, 12))
+
+        self.move_button = ctk.CTkButton(
+            actions,
+            text="MOVE FOLDER",
+            command=self.move_folder_from_ui,
+            fg_color=self.colors.accent,
+            hover_color="#29f2ff",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            width=180,
+            height=38,
+        )
+        self.move_button.pack(side="left")
+
+    def _build_windows_panel(self, parent):
+        ctk.CTkLabel(
+            parent,
+            text="ACTIVE WINDOWS",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        self.window_listbox = self._tk_listbox(
+            parent,
+            bg="#000814",
+            fg=self.colors.text,
+            selectbackground="#00bfa5",
+            font=("Consolas", 10),
+        )
+        self.window_listbox.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.window_listbox.bind("<Double-Button-1>", self.on_window_activate)
+
+    def _tk_canvas(self, parent, **kwargs):
+        import tkinter as tk
+
+        return tk.Canvas(parent, highlightthickness=0, bd=0, **kwargs)
+
+    def _tk_listbox(self, parent, **kwargs):
+        import tkinter as tk
+
+        return tk.Listbox(parent, activestyle="none", **kwargs)
+
     def _init_orb_visual(self):
-        """Draw a simple animated orb to act as a 'core' on the side."""
         c = self.orb_canvas
         w = int(c["width"])
         h = int(c["height"])
         cx, cy = w // 2, h // 2
 
-        # Base outer ring
         self._orb_outer = c.create_oval(
-            cx - 28, cy - 28, cx + 28, cy + 28,
-            outline="#00e5ff",
-            width=2
+            cx - 28,
+            cy - 28,
+            cx + 28,
+            cy + 28,
+            outline=self.colors.accent,
+            width=2,
         )
-        # Inner glow
         self._orb_inner = c.create_oval(
-            cx - 16, cy - 16, cx + 16, cy + 16,
-            fill="#00bfa5",
-            outline=""
+            cx - 16, cy - 16, cx + 16, cy + 16, fill="#00bfa5", outline=""
         )
-        # Pulsing center
         self._orb_pulse = c.create_oval(
-            cx - 6, cy - 6, cx + 6, cy + 6,
-            fill="#e0f7fa",
-            outline=""
+            cx - 6, cy - 6, cx + 6, cy + 6, fill=self.colors.text, outline=""
         )
         self._orb_pulse_dir = 1
         self._animate_orb_pulse()
 
     def _animate_orb_pulse(self):
-        """Subtle breathing animation for the orb center."""
-        try:
-            c = self.orb_canvas
-        except Exception:
-            return
-
+        c = self.orb_canvas
         try:
             x0, y0, x1, y1 = c.coords(self._orb_pulse)
         except Exception:
             return
 
-        # Compute new size
         delta = 0.8 * self._orb_pulse_dir
         x0 -= delta
         y0 -= delta
         x1 += delta
         y1 += delta
 
-        # Clamp sizes
         max_radius = 10
         min_radius = 4
         cx = (x0 + x1) / 2
@@ -447,13 +742,34 @@ class VoiceAssistantGUI:
             self._orb_pulse_dir = 1
 
         c.coords(self._orb_pulse, cx - r, cy - r, cx + r, cy + r)
-        # Schedule next frame
         self.root.after(90, self._animate_orb_pulse)
 
+    # ---------------------------
+    # Logging / status
+    # ---------------------------
+    def log(self, message: str):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {message}\n"
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", line)
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def clear_log(self):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+        self.log("Log cleared")
+
+    def update_status(self, status: str, color: str | None = None):
+        self.status_label.configure(text=status, text_color=(color or self.colors.ok))
+        self.root.update_idletasks()
+
+    # ---------------------------
+    # Active windows
+    # ---------------------------
     def refresh_window_list(self):
-        """Populate the ACTIVE WINDOWS panel using pygetwindow, if available."""
         if not gw:
-            # If pygetwindow missing, do nothing
             return
 
         try:
@@ -462,24 +778,21 @@ class VoiceAssistantGUI:
             windows = []
 
         self._window_handles = []
-        self.window_listbox.delete(0, tk.END)
+        self.window_listbox.delete(0, "end")
 
         for w in windows:
             try:
                 title = (w.title or "").strip()
                 if not title or not w.isVisible:
                     continue
-                label = title
                 self._window_handles.append(w)
-                self.window_listbox.insert(tk.END, label)
+                self.window_listbox.insert("end", title)
             except Exception:
                 continue
 
-        # Update every few seconds
         self.root.after(4000, self.refresh_window_list)
 
     def on_window_activate(self, event=None):
-        """When the user double-clicks a window entry, bring that app to the front."""
         if not self._window_handles:
             return
         try:
@@ -498,270 +811,854 @@ class VoiceAssistantGUI:
         except Exception:
             pass
 
-    def handle_command(self, text: str):
-        """Handle a simple text command (fallback/example)."""
-        if not text:
-            self.voice_engine.speak("I didn't catch that, sir.")
-            return
-
-        print(f"Processing: {text}")
-        if "hello" in text:
-            self.voice_engine.speak("Hello sir, how can I help you today?")
-        else:
-            self.voice_engine.speak("I understood the command, but I don't have a protocol for that yet.")
-
-    def handle_text_command(self, event=None):
-        """Called by the Send button or Enter key. Routes typed text to the command processor.
-
-        If the processor doesn't recognize the command, fall back to `handle_command`.
-        """
+    # ---------------------------
+    # Voice control
+    # ---------------------------
+    def update_voice_settings(self):
         try:
-            text = self.command_entry.get().strip()
-        except Exception:
-            text = ''
-
-        # Clear the entry for convenience
-        try:
-            self.command_entry.delete(0, tk.END)
+            speed = int(self.speed_var.get())
+            volume = float(self.volume_var.get())
+            self.voice_engine.set_voice_properties(rate=speed, volume=volume)
+            self.log(f"Voice updated: speed={speed}, volume={volume:.2f}")
         except Exception:
             pass
 
-        if not text:
-            self.voice_engine.speak("Please type a command.")
-            return
-
-        self.log(f"Typed command: {text}")
-
-        handled = False
-        try:
-            if hasattr(self, 'command_processor') and self.command_processor:
-                handled = self.command_processor.process(text)
-        except Exception as e:
-            print(f"Error processing text command: {e}")
-            self.voice_engine.speak("There was an error processing that command.")
-
-        if not handled:
-            # Fallback: local/simple handler
-            try:
-                self.handle_command(text)
-            except Exception as e:
-                print(f"Fallback handler error: {e}")
-                self.voice_engine.speak("I couldn't handle that command.")
-    
-    def log(self, message: str):
-        """Add a message to the activity log."""
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        log_message = f"[{timestamp}] {message}\n"
-        
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, log_message)
-        self.log_text.see(tk.END)
-        self.log_text.config(state=tk.DISABLED)
-    
-    def clear_log(self):
-        """Clear the activity log."""
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.delete(1.0, tk.END)
-        self.log_text.config(state=tk.DISABLED)
-        self.log("Log cleared")
-    
-    def update_status(self, status: str, color: str = '#2ecc71'):
-        """Update the status bar."""
-        self.status_label.config(text=status, fg=color)
-        self.root.update()
-    
-    def update_voice_settings(self, value=None):
-        """Update voice speed and volume."""
-        speed = self.speed_var.get()
-        volume = self.volume_var.get()
-        self.voice_engine.set_voice_properties(rate=speed, volume=volume)
-    
-    def start_xo_game(self):
-        """Launch XO game via command processor."""
-        if hasattr(self, 'command_processor') and self.command_processor:
-            self.command_processor.start_xo_game("xo")
-        else:
-            self.voice_engine.speak("Command processor not available.")
-    
-    def toggle_chatbot(self):
-        """Toggle chatbot mode on/off."""
-        if not hasattr(self, 'command_processor') or not self.command_processor:
-            self.voice_engine.speak("Command processor not available.")
-            return
-        
-        if not self.command_processor.chatbot:
-            self.voice_engine.speak("Chatbot module not available, bro.")
-            return
-        
-        if self.command_processor.chatbot.chat_mode_active:
-            self.command_processor.chatbot.deactivate()
-            self.chatbot_button.config(text="💬 CHATBOT", bg='#00bcd4')
-        else:
-            self.command_processor.chatbot.activate()
-            self.chatbot_button.config(text="💬 CHAT ON", bg='#4caf50')
-    
     def start_listening(self):
-        """Start listening for voice commands."""
+        try:
+            self.voice_engine.stop_speaking()
+        except Exception:
+            pass
+
         if self.is_listening:
             return
-            
-        # --- NEW: Interrupt the assistant if it's currently talking ---
-        if hasattr(self, 'voice_engine'):
-            self.voice_engine.stop_speaking()
-        
+
         self.is_listening = True
-        self.listen_button.config(state=tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL)
-        self.update_status("Listening...", '#f39c12')
+        self.listen_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self.update_status("Listening…", self.colors.warn)
         self.log("Voice listening started")
-        
-        # Start listening in a separate thread
-        self.listen_thread = threading.Thread(target=self.listen_loop, daemon=True)
-        self.listen_thread.start()
-    
+
+        threading.Thread(target=self.listen_loop, daemon=True).start()
+
     def stop_listening(self):
-        """Stop listening for voice commands."""
         self.is_listening = False
-        self.listen_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
-        self.update_status("Stopped", '#e74c3c')
+        self.listen_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
+        self.update_status("Stopped", self.colors.danger)
         self.log("Voice listening stopped")
-    
+
     def listen_loop(self):
-        print("Friday is standing by...")
-        # Loop while the GUI believes we're listening
         while self.is_listening:
             try:
-                # SAFETY CHECK: don't listen while TTS playback is busy
-                if pygame and getattr(pygame, 'mixer', None):
-                    try:
-                        if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
-                            time.sleep(0.2)
-                            continue
-                    except Exception:
-                        pass
+                try:
+                    if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                        time.sleep(0.2)
+                        continue
+                except Exception:
+                    pass
 
-                # Prefer the lightweight listen_for_command helper
                 text = None
                 try:
-                    if hasattr(self.voice_engine, 'listen_for_command'):
+                    if hasattr(self.voice_engine, "listen_for_command"):
                         text = self.voice_engine.listen_for_command()
-                    elif hasattr(self.voice_engine, 'listen'):
+                    elif hasattr(self.voice_engine, "listen"):
                         text = self.voice_engine.listen()
-                except Exception as e:
-                    print(f"Listen error: {e}")
+                except Exception:
                     text = None
 
                 if text:
                     text = text.strip()
-                    self.log(f"Heard: {text}")
-                    # Route to the command processor first
-                    handled = False
-                    try:
-                        if hasattr(self, 'command_processor') and self.command_processor:
-                            handled = self.command_processor.process(text)
-                    except Exception as e:
-                        print(f"Processing error: {e}")
-                        try:
-                            self.voice_engine.speak("There was an error processing your command.")
-                        except Exception:
-                            pass
+                    self.root.after(0, lambda t=text: self._handle_recognized_text(t))
 
-                    if not handled:
-                        # Fallback local handler
-                        try:
-                            self.handle_command(text)
-                        except Exception as e:
-                            print(f"Fallback handler error: {e}")
-
-                # small sleep to avoid busy loop
                 time.sleep(0.1)
-
-            except Exception as e:
-                print(f"Loop error: {e}")
+            except Exception:
                 time.sleep(0.5)
 
-        # Reset UI state when loop exits
+        self.root.after(0, self.stop_listening)
+
+    def _handle_recognized_text(self, text: str):
+        text = (text or "").strip()
+        if not text:
+            return
+
+        self.log(f"Heard: {text}")
+
+        if self._voice_form:
+            self._voice_form_handle(text)
+            return
+
+        lowered = text.lower()
+        if ("create" in lowered and "folder" in lowered) or "new folder" in lowered:
+            self._voice_form_start_create_folder()
+            return
+
+        if ("move" in lowered and "folder" in lowered) or lowered.strip() == "move":
+            self._voice_form_start_move_folder()
+            return
+
+        handled = False
         try:
-            self.is_listening = False
-            self.listen_button.config(state=tk.NORMAL)
-            self.stop_button.config(state=tk.DISABLED)
-            self.update_status("Stopped", '#e74c3c')
-            self.log("Voice listening stopped")
-        except Exception:
-            pass
-    def start_friday(self):
-        # 1. Start the permanent background listener
-        # This keeps the mic stream OPEN and STABLE
-        if hasattr(self.voice_engine, 'recognizer') and self.voice_engine.recognizer:
+            handled = bool(self.command_processor.process(text))
+        except Exception as e:
+            self.log(f"Command processor error: {e}")
+
+        if not handled:
+            self._fallback_handle_command(text)
+
+    def background_listener(self):
+        while True:
             try:
-                self.voice_engine.recognizer.listen_in_background(
-                    self.voice_engine.mic,
-                    self.background_callback
-                )
-                print("Mic stream stabilized.")
-            except Exception as e:
-                print(f"Could not start background listener: {e}")
+                if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                    time.sleep(1)
+                    continue
 
-    def background_callback(self, recognizer, audio):
-        """This runs every time the mic hears sound without closing the stream."""
+                if self.is_hidden and hasattr(self.voice_engine, "listen_offline"):
+                    result = self.voice_engine.listen_offline(timeout=2)
+                    if (result or "").strip().lower() == "friday":
+                        self.root.after(0, self.show_interface)
+            except Exception:
+                pass
+            time.sleep(0.4)
+
+    def show_interface(self):
+        self.is_hidden = False
         try:
-            if self.is_hidden:
-                # Fast check for wake word
-                text = recognizer.recognize_google(audio).lower()
-                if "friday" in text:
-                    self.root.after(0, self.show_interface)
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self.root.after(1200, lambda: self.root.attributes("-topmost", False))
         except Exception:
             pass
-    
+        try:
+            self.voice_engine.speak("I'm here. What can I do for you?")
+        except Exception:
+            pass
+        self.start_listening()
+
+    def toggle_chatbot(self):
+        try:
+            enabled = bool(self._chatbot_var.get())
+            if hasattr(self.command_processor, "chatbot_mode"):
+                self.command_processor.chatbot_mode = enabled
+            self.log(f"Chatbot mode: {'ON' if enabled else 'OFF'}")
+        except Exception:
+            pass
+
+    # ---------------------------
+    # Voice-controlled popups (no keyboard)
+    # ---------------------------
+    def _voice_form_reset(self):
+        if not self._voice_form:
+            return
+        try:
+            win = self._voice_form.get("window")
+            if win and win.winfo_exists():
+                win.destroy()
+        except Exception:
+            pass
+        self._voice_form = None
+        self.update_status("Ready", self.colors.ok)
+
+    def _default_user_location(self) -> str:
+        home = os.path.expanduser("~")
+        for candidate in ("Desktop", "Downloads", "Documents"):
+            p = os.path.join(home, candidate)
+            if os.path.isdir(p):
+                return p
+        return home
+
+    def _extract_folder_name(self, text: str) -> str:
+        t = (text or "").strip()
+        for prefix in ("name it", "call it", "folder name", "the name is"):
+            if t.lower().startswith(prefix):
+                t = t[len(prefix) :].strip()
+                break
+        t = t.strip("\"' ").strip()
+        t = t.replace("/", " ").replace("\\", " ").strip()
+        return t
+
+    def _location_from_speech(self, text: str) -> str | None:
+        t = (text or "").lower()
+        home = os.path.expanduser("~")
+        if "desktop" in t:
+            return os.path.join(home, "Desktop")
+        if "downloads" in t:
+            return os.path.join(home, "Downloads")
+        if "documents" in t:
+            return os.path.join(home, "Documents")
+        if "home" in t:
+            return home
+        if t.startswith("/") or (":" in t and "\\" in t):
+            return text.strip()
+        if "path " in t:
+            return text.split(" ", 1)[1].strip() if " " in text else None
+        return None
+
+    def _unique_path(self, path: str) -> str:
+        if not os.path.exists(path):
+            return path
+        base = path
+        n = 1
+        while True:
+            candidate = f"{base} ({n})"
+            if not os.path.exists(candidate):
+                return candidate
+            n += 1
+
+    def _voice_form_start_create_folder(self):
+        if self._voice_form:
+            return
+
+        dest_dir = self._default_user_location()
+        self._voice_form = {
+            "mode": "create_folder",
+            "step": "name",
+            "name": "",
+            "dest_dir": dest_dir,
+        }
+
+        win = ctk.CTkToplevel(self.root)
+        win.title("Create Folder (Voice)")
+        win.geometry("560x260")
+        win.configure(fg_color=self.colors.bg)
+        win.attributes("-topmost", True)
+        win.protocol("WM_DELETE_WINDOW", self._voice_form_reset)
+
+        title = ctk.CTkLabel(
+            win,
+            text="CREATE NEW FOLDER",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=14, weight="bold"),
+        )
+        title.pack(anchor="w", padx=16, pady=(16, 8))
+
+        body = ctk.CTkFrame(win, fg_color=self.colors.panel, corner_radius=12)
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+
+        name_label = ctk.CTkLabel(
+            body,
+            text="Name: (waiting…) ",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+        )
+        name_label.pack(anchor="w", padx=14, pady=(14, 6))
+
+        loc_label = ctk.CTkLabel(
+            body,
+            text=f"Location: {dest_dir}",
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            wraplength=520,
+            justify="left",
+        )
+        loc_label.pack(anchor="w", padx=14, pady=(0, 10))
+
+        hint = ctk.CTkLabel(
+            body,
+            text="Say the folder name. Then say: desktop / downloads / documents / home, or say: confirm. Say: cancel to stop.",
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            wraplength=520,
+            justify="left",
+        )
+        hint.pack(anchor="w", padx=14, pady=(0, 12))
+
+        self._voice_form["window"] = win
+        self._voice_form["name_label"] = name_label
+        self._voice_form["loc_label"] = loc_label
+
+        try:
+            self.voice_engine.speak("What should I name the folder?")
+        except Exception:
+            pass
+        self.update_status("Voice: folder name?", self.colors.warn)
+
+    def _voice_form_start_move_folder(self):
+        if self._voice_form:
+            return
+
+        self._voice_form = {
+            "mode": "move_folder",
+            "step": "source",
+            "src": "",
+            "dst": "",
+            "on_conflict": "Rename",
+        }
+
+        win = ctk.CTkToplevel(self.root)
+        win.title("Move Folder (Voice)")
+        win.geometry("680x320")
+        win.configure(fg_color=self.colors.bg)
+        win.attributes("-topmost", True)
+        win.protocol("WM_DELETE_WINDOW", self._voice_form_reset)
+
+        title = ctk.CTkLabel(
+            win,
+            text="MOVE FOLDER",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=14, weight="bold"),
+        )
+        title.pack(anchor="w", padx=16, pady=(16, 8))
+
+        body = ctk.CTkFrame(win, fg_color=self.colors.panel, corner_radius=12)
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+
+        src_label = ctk.CTkLabel(
+            body,
+            text="Source: (waiting…)",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            wraplength=640,
+            justify="left",
+        )
+        src_label.pack(anchor="w", padx=14, pady=(14, 6))
+
+        dst_label = ctk.CTkLabel(
+            body,
+            text="Destination: (waiting…)",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            wraplength=640,
+            justify="left",
+        )
+        dst_label.pack(anchor="w", padx=14, pady=(0, 10))
+
+        hint = ctk.CTkLabel(
+            body,
+            text="Say the source folder path. Then say the destination folder path. Say: confirm to move. Say: cancel to stop.",
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            wraplength=640,
+            justify="left",
+        )
+        hint.pack(anchor="w", padx=14, pady=(0, 12))
+
+        self._voice_form["window"] = win
+        self._voice_form["src_label"] = src_label
+        self._voice_form["dst_label"] = dst_label
+
+        try:
+            self.voice_engine.speak("Tell me the source folder path.")
+        except Exception:
+            pass
+        self.update_status("Voice: source folder?", self.colors.warn)
+
+    def _voice_form_handle(self, text: str):
+        form = self._voice_form
+        if not form:
+            return
+
+        lowered = (text or "").strip().lower()
+        if "cancel" in lowered or lowered in {"stop", "never mind", "nevermind"}:
+            self.log("Voice operation cancelled.")
+            try:
+                self.voice_engine.speak("Cancelled.")
+            except Exception:
+                pass
+            self._voice_form_reset()
+            return
+
+        if form.get("mode") == "create_folder":
+            self._voice_form_handle_create_folder(text)
+            return
+        if form.get("mode") == "move_folder":
+            self._voice_form_handle_move_folder(text)
+            return
+
+    def _voice_form_handle_create_folder(self, text: str):
+        form = self._voice_form or {}
+        step = form.get("step")
+
+        if step == "name":
+            name = self._extract_folder_name(text)
+            if not name:
+                try:
+                    self.voice_engine.speak("I didn't catch the name. Please say it again.")
+                except Exception:
+                    pass
+                return
+
+            form["name"] = name
+            form["step"] = "location_or_confirm"
+            try:
+                lbl = form.get("name_label")
+                if lbl:
+                    lbl.configure(text=f"Name: {name}")
+            except Exception:
+                pass
+
+            try:
+                self.voice_engine.speak(
+                    "Where should I create it? Say desktop, downloads, documents, home, or say confirm."
+                )
+            except Exception:
+                pass
+            self.update_status("Voice: location or confirm?", self.colors.warn)
+            self._voice_form = form
+            return
+
+        if step == "location_or_confirm":
+            if "confirm" in text.lower() or text.strip().lower() in {"create", "go ahead"}:
+                self._voice_form_create_folder_now()
+                return
+
+            loc = self._location_from_speech(text)
+            if loc:
+                loc = os.path.expanduser(loc)
+                form["dest_dir"] = loc
+                try:
+                    lbl = form.get("loc_label")
+                    if lbl:
+                        lbl.configure(text=f"Location: {loc}")
+                except Exception:
+                    pass
+                try:
+                    self.voice_engine.speak("Say confirm to create the folder.")
+                except Exception:
+                    pass
+                self.update_status("Voice: confirm to create", self.colors.warn)
+                self._voice_form = form
+                return
+
+            try:
+                self.voice_engine.speak("Say desktop, downloads, documents, home, or confirm.")
+            except Exception:
+                pass
+            return
+
+    def _voice_form_create_folder_now(self):
+        form = self._voice_form
+        if not form:
+            return
+        name = (form.get("name") or "").strip()
+        dest_dir = (form.get("dest_dir") or "").strip()
+        if not name:
+            return
+
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+        except Exception as e:
+            self.log(f"Create folder failed (location): {e}")
+            try:
+                self.voice_engine.speak("I couldn't access that location.")
+            except Exception:
+                pass
+            return
+
+        target = os.path.join(dest_dir, name)
+        target = self._unique_path(target)
+        try:
+            os.makedirs(target, exist_ok=False)
+            self.log(f"Folder created: {target}")
+            try:
+                self.voice_engine.speak("Folder created.")
+            except Exception:
+                pass
+            self._voice_form_reset()
+        except Exception as e:
+            self.log(f"Create folder failed: {e}")
+            try:
+                self.voice_engine.speak("I couldn't create that folder.")
+            except Exception:
+                pass
+
+    def _voice_form_handle_move_folder(self, text: str):
+        form = self._voice_form or {}
+        step = form.get("step")
+
+        if step == "source":
+            src = self._location_from_speech(text) or text.strip()
+            src = os.path.expanduser(src)
+            if not os.path.isdir(src):
+                self.log("Source not found; waiting again.")
+                try:
+                    self.voice_engine.speak("That source folder does not exist. Please say the full path again.")
+                except Exception:
+                    pass
+                return
+            form["src"] = src
+            form["step"] = "destination"
+            try:
+                lbl = form.get("src_label")
+                if lbl:
+                    lbl.configure(text=f"Source: {src}")
+            except Exception:
+                pass
+            try:
+                self.voice_engine.speak("Now tell me the destination folder path.")
+            except Exception:
+                pass
+            self.update_status("Voice: destination folder?", self.colors.warn)
+            self._voice_form = form
+            return
+
+        if step == "destination":
+            dst = self._location_from_speech(text) or text.strip()
+            dst = os.path.expanduser(dst)
+            if not os.path.isdir(dst):
+                self.log("Destination not found; waiting again.")
+                try:
+                    self.voice_engine.speak(
+                        "That destination folder does not exist. Please say the full path again."
+                    )
+                except Exception:
+                    pass
+                return
+            form["dst"] = dst
+            form["step"] = "confirm"
+            try:
+                lbl = form.get("dst_label")
+                if lbl:
+                    lbl.configure(text=f"Destination: {dst}")
+            except Exception:
+                pass
+            try:
+                self.voice_engine.speak("Say confirm to move the folder.")
+            except Exception:
+                pass
+            self.update_status("Voice: confirm to move", self.colors.warn)
+            self._voice_form = form
+            return
+
+        if step == "confirm":
+            if "confirm" not in text.lower() and text.strip().lower() not in {"move", "go ahead"}:
+                try:
+                    self.voice_engine.speak("Say confirm to move, or cancel.")
+                except Exception:
+                    pass
+                return
+            src = form.get("src") or ""
+            dst = form.get("dst") or ""
+            self.log(f"Voice move confirmed: {src} -> {dst}")
+            self.start_folder_move(src=src, dst=dst, on_conflict=form.get("on_conflict", "Rename"))
+            try:
+                self.voice_engine.speak("Moving now.")
+            except Exception:
+                pass
+            self._voice_form_reset()
+
+    # ---------------------------
+    # Typed commands
+    # ---------------------------
+    def handle_text_command(self):
+        text = (self.command_entry.get() or "").strip()
+        self.command_entry.delete(0, "end")
+
+        if not text:
+            try:
+                self.voice_engine.speak("Please type a command.")
+            except Exception:
+                pass
+            return
+
+        self.log(f"Typed command: {text}")
+
+        if self._handle_local_text_commands(text):
+            return
+
+        handled = False
+        try:
+            handled = bool(self.command_processor.process(text))
+        except Exception as e:
+            self.log(f"Error processing command: {e}")
+
+        if not handled:
+            self._fallback_handle_command(text)
+
+    def _handle_local_text_commands(self, text: str) -> bool:
+        try:
+            parts = shlex.split(text)
+        except Exception:
+            parts = text.split()
+
+        if not parts:
+            return False
+
+        cmd = parts[0].lower()
+        if cmd == "download" and len(parts) >= 2:
+            url = parts[1]
+            out_dir = parts[2] if len(parts) >= 3 else self.yt_out_dir.get()
+            self.start_youtube_download(url=url, out_dir=out_dir, mode=self.yt_mode.get())
+            return True
+
+        if cmd == "move" and len(parts) >= 3:
+            src = parts[1]
+            dst = parts[2]
+            self.start_folder_move(
+                src=src, dst=dst, on_conflict=self.move_on_conflict.get()
+            )
+            return True
+
+        return False
+
+    def _fallback_handle_command(self, text: str):
+        if "hello" in text.lower():
+            try:
+                self.voice_engine.speak("Hello. How can I help you today?")
+            except Exception:
+                pass
+        else:
+            try:
+                self.voice_engine.speak(
+                    "I understood the command, but I don't have a protocol for that yet."
+                )
+            except Exception:
+                pass
+
+    # ---------------------------
+    # YouTube download (yt-dlp)
+    # ---------------------------
+    def _browse_youtube_out_dir(self):
+        directory = filedialog.askdirectory(title="Select download folder")
+        if directory:
+            self.yt_out_dir.set(directory)
+
+    def _open_youtube_out_dir(self):
+        path = self.yt_out_dir.get().strip()
+        if not path:
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            self.log(f"Could not open folder: {e}")
+
+    def download_youtube_from_ui(self):
+        url = self.yt_url.get().strip()
+        out_dir = self.yt_out_dir.get().strip()
+        mode = self.yt_mode.get()
+        self.start_youtube_download(url=url, out_dir=out_dir, mode=mode)
+
+    def start_youtube_download(self, url: str, out_dir: str, mode: str):
+        if not url:
+            messagebox.showwarning("Missing URL", "Paste a YouTube URL first.")
+            return
+        if not out_dir:
+            messagebox.showwarning("Missing folder", "Choose a download folder.")
+            return
+        os.makedirs(out_dir, exist_ok=True)
+
+        if self._download_thread and self._download_thread.is_alive():
+            messagebox.showinfo("Download busy", "A download is already running.")
+            return
+
+        self.log(f"Download requested: {url}")
+        self.update_status("Downloading…", self.colors.warn)
+        self.yt_download_button.configure(state="disabled")
+
+        self._download_thread = threading.Thread(
+            target=self._download_youtube_worker,
+            args=(url, out_dir, mode),
+            daemon=True,
+        )
+        self._download_thread.start()
+
+    def _download_youtube_worker(self, url: str, out_dir: str, mode: str):
+        try:
+            try:
+                import yt_dlp  # type: ignore
+            except Exception:
+                yt_dlp = None
+
+            if yt_dlp is None:
+                self.root.after(
+                    0,
+                    lambda: self.log(
+                        "yt-dlp not installed. Install with: pip install yt-dlp"
+                    ),
+                )
+                return
+
+            outtmpl = os.path.join(out_dir, "%(title)s.%(ext)s")
+            ydl_opts: dict = {"outtmpl": outtmpl, "noplaylist": True}
+
+            if mode == "Audio (mp3)":
+                ydl_opts.update(
+                    {
+                        "format": "bestaudio/best",
+                        "postprocessors": [
+                            {
+                                "key": "FFmpegExtractAudio",
+                                "preferredcodec": "mp3",
+                                "preferredquality": "192",
+                            }
+                        ],
+                    }
+                )
+            elif mode == "Video (mp4)":
+                ydl_opts.update({"format": "bv*+ba/best", "merge_output_format": "mp4"})
+            else:
+                ydl_opts.update({"format": "bv*+ba/best"})
+
+            last_progress = {"t": 0.0, "msg": ""}
+
+            def hook(d):
+                if d.get("status") != "downloading":
+                    return
+                now = time.time()
+                if now - last_progress["t"] < 0.6:
+                    return
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                downloaded = d.get("downloaded_bytes") or 0
+                pct = (downloaded / total * 100.0) if total else 0.0
+                speed = d.get("speed") or 0
+                eta = d.get("eta")
+                msg = (
+                    f"Downloading… {pct:5.1f}% | {self._human_bytes(speed)}/s | ETA {eta}s"
+                    if eta
+                    else f"Downloading… {pct:5.1f}%"
+                )
+                if msg == last_progress["msg"]:
+                    return
+                last_progress["t"] = now
+                last_progress["msg"] = msg
+                self.root.after(0, lambda m=msg: self.update_status(m, self.colors.warn))
+
+            ydl_opts["progress_hooks"] = [hook]
+
+            self.root.after(0, lambda: self.log(f"Saving to: {out_dir}"))
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+            self.root.after(0, lambda: self.log("Download complete."))
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"Download failed: {e}"))
+        finally:
+            self.root.after(0, lambda: self.update_status("Ready", self.colors.ok))
+            self.root.after(
+                0, lambda: self.yt_download_button.configure(state="normal")
+            )
+
+    def _human_bytes(self, n: float) -> str:
+        try:
+            n = float(n)
+        except Exception:
+            return "0B"
+        units = ["B", "KB", "MB", "GB", "TB"]
+        i = 0
+        while n >= 1024 and i < len(units) - 1:
+            n /= 1024.0
+            i += 1
+        return f"{n:.1f}{units[i]}"
+
+    # ---------------------------
+    # Folder move
+    # ---------------------------
+    def _browse_move_src(self):
+        directory = filedialog.askdirectory(title="Select source folder")
+        if directory:
+            self.move_src.set(directory)
+
+    def _browse_move_dst(self):
+        directory = filedialog.askdirectory(title="Select destination folder")
+        if directory:
+            self.move_dst.set(directory)
+
+    def move_folder_from_ui(self):
+        src = self.move_src.get().strip()
+        dst = self.move_dst.get().strip()
+        self.start_folder_move(src=src, dst=dst, on_conflict=self.move_on_conflict.get())
+
+    def start_folder_move(self, src: str, dst: str, on_conflict: str):
+        if not src or not dst:
+            messagebox.showwarning(
+                "Missing paths", "Choose a source and destination folder."
+            )
+            return
+        if not os.path.isdir(src):
+            messagebox.showerror("Invalid source", "Source folder does not exist.")
+            return
+        if not os.path.isdir(dst):
+            messagebox.showerror("Invalid destination", "Destination folder does not exist.")
+            return
+
+        if self._move_thread and self._move_thread.is_alive():
+            messagebox.showinfo("Move busy", "A move operation is already running.")
+            return
+
+        self.move_button.configure(state="disabled")
+        self.update_status("Moving…", self.colors.warn)
+        self.log(f"Move requested: {src} -> {dst}")
+
+        self._move_thread = threading.Thread(
+            target=self._move_folder_worker,
+            args=(src, dst, on_conflict),
+            daemon=True,
+        )
+        self._move_thread.start()
+
+    def _move_folder_worker(self, src: str, dst: str, on_conflict: str):
+        try:
+            base = os.path.basename(os.path.normpath(src))
+            dest_path = os.path.join(dst, base)
+
+            if os.path.abspath(src) == os.path.abspath(dest_path):
+                raise RuntimeError("Source and destination are the same folder.")
+
+            if os.path.exists(dest_path):
+                if on_conflict == "Fail":
+                    raise FileExistsError(f"Destination already exists: {dest_path}")
+                ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                dest_path = os.path.join(dst, f"{base}-moved-{ts}")
+                self.root.after(
+                    0, lambda: self.log(f"Destination exists; renaming to: {dest_path}")
+                )
+
+            shutil.move(src, dest_path)
+            self.root.after(0, lambda: self.log(f"Move complete: {dest_path}"))
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"Move failed: {e}"))
+        finally:
+            self.root.after(0, lambda: self.update_status("Ready", self.colors.ok))
+            self.root.after(0, lambda: self.move_button.configure(state="normal"))
+
+    # ---------------------------
+    # Help
+    # ---------------------------
     def show_help(self):
-        """Show help information."""
-        help_text = """
-PERSONAL VOICE ASSISTANT - COMMAND GUIDE
-==========================================
+        help_text = (
+            "FRIDAY COMMAND GUIDE\n"
+            "====================\n\n"
+            "Voice commands depend on your local CommandProcessor.\n"
+            "Typed commands always work in the Console tab.\n\n"
+            "VOICE POPUPS (NO KEYBOARD):\n"
+            "  - Say: create a new folder\n"
+            "    - Then say the folder name\n"
+            "    - Then say: desktop / downloads / documents / home, or say: confirm\n"
+            "  - Say: move folder\n"
+            "    - Then say the source folder path\n"
+            "    - Then say the destination folder path (parent folder)\n"
+            "    - Then say: confirm\n"
+            "  - Say: cancel to stop\n\n"
+            "TYPED COMMANDS:\n"
+            "  download <url> [out_dir]\n"
+            "  move \"<src_folder>\" \"<dst_folder>\"\n\n"
+            "UI FEATURES:\n"
+            "  - YouTube tab: download video/audio (requires yt-dlp + ffmpeg for mp3)\n"
+            "  - Files tab: move a folder to another location\n\n"
+            "NOTES:\n"
+            "  - Only download content you own or have permission to download.\n"
+        )
 
-VOICE COMMANDS:
-- Time: "What is the time?" or "Tell me the time"
-- Date: "What is the date?" or "Tell me the date"
-- Weather: "What is the weather?" or "Weather forecast"
-- Greeting: "Hello" or "Hi"
-- Open URL: "Open [website]" (e.g., "Open google.com")
-- Search: "Search for [topic]"
-- Research: "Research [topic]"
-- Open App: "Open [application name]"
-- Execute Command: "Execute [command]"
-- Help: "Help"
+        win = ctk.CTkToplevel(self.root)
+        win.title("Help")
+        win.geometry("700x520")
+        win.configure(fg_color=self.colors.bg)
 
-TIPS:
-1. Click "Start Listening" to activate voice recognition
-2. Speak clearly and naturally
-3. Wait for the beep to finish speaking
-4. Adjust voice speed and volume in Settings
-5. Check the Activity Log for command history
-
-REQUIREMENTS:
-- Microphone (for voice input)
-- Speaker (for voice output)
-- Internet connection (for web searches and weather)
-
-Powered by Python, Tkinter, PyAutoGUI, and Local Voice Engine
-        """
-        
-        help_window = tk.Toplevel(self.root)
-        help_window.title("Help - Personal Voice Assistant")
-        help_window.geometry("600x500")
-        
-        text_widget = scrolledtext.ScrolledText(help_window, font=('Courier', 10))
-        text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        text_widget.insert(tk.END, help_text)
-        text_widget.config(state=tk.DISABLED)
+        box = ctk.CTkTextbox(
+            win, fg_color=self.colors.bg, text_color=self.colors.text, font=("Consolas", 11)
+        )
+        box.pack(fill="both", expand=True, padx=14, pady=14)
+        box.insert("end", help_text)
+        box.configure(state="disabled")
 
 
 def main():
-    """Main entry point for the application."""
-    root = tk.Tk()
-    app = VoiceAssistantGUI(root)
-    root.mainloop()
+    app = FridayGUI()
+    app.root.mainloop()
 
 
 if __name__ == "__main__":
