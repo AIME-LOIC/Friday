@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import datetime
 import json
+import secrets
 import os
 import shlex
 import shutil
@@ -19,8 +20,10 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox
+from io import BytesIO
 
 # Optional window-management imports for a Jarvis-style dashboard
 try:
@@ -103,6 +106,13 @@ try:
 except Exception:
     Image = None  # type: ignore[assignment]
 
+try:
+    from flask import Flask, Response, request  # type: ignore
+except Exception:
+    Flask = None  # type: ignore[assignment]
+    Response = None  # type: ignore[assignment]
+    request = None  # type: ignore[assignment]
+
 
 @dataclass(frozen=True)
 class FridayColors:
@@ -125,6 +135,19 @@ class _FallbackCommandProcessor:
 
     def process(self, command: str) -> bool:
         return False
+
+
+def _get_local_ip() -> str:
+    try:
+        import socket
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
 class FridayGUI:
@@ -150,6 +173,7 @@ class FridayGUI:
         self.root.geometry("1200x720")
         self.root.minsize(1100, 650)
         self.root.configure(fg_color=self.colors.bg)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_app_close)
 
         self.is_listening = False
         self.is_hidden = False
@@ -183,6 +207,8 @@ class FridayGUI:
         self._mouse_control_enabled = ctk.BooleanVar(value=False)
         self._window_move_enabled = ctk.BooleanVar(value=False)
         self._close_window_enabled = ctk.BooleanVar(value=False)
+        self._screenshot_enabled = ctk.BooleanVar(value=False)
+        self._fist_action = ctk.StringVar(value="Stop listening")
         self._mouse_smooth = {"x": None, "y": None}
         self._window_drag = {"active": False, "win": None, "dx": 0, "dy": 0}
 
@@ -217,6 +243,24 @@ class FridayGUI:
 
         threading.Thread(target=self.background_listener, daemon=True).start()
         self.root.after(400, self._startup_greeting)
+
+    def on_app_close(self):
+        try:
+            self.stop_share_server()
+        except Exception:
+            pass
+        try:
+            self.stop_camera_preview()
+        except Exception:
+            pass
+        try:
+            self.stop_gestures()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def _load_config(self) -> dict:
         def deep_merge(a: dict, b: dict) -> dict:
@@ -566,6 +610,8 @@ class FridayGUI:
         self.tab_commands = self.tabs.add("Commands")
         self.tab_system = self.tabs.add("System")
         self.tab_camera = self.tabs.add("Camera")
+        self.tab_maps = self.tabs.add("Maps")
+        self.tab_share = self.tabs.add("Share")
         self.tab_youtube = self.tabs.add("YouTube")
         self.tab_files = self.tabs.add("Files")
 
@@ -573,6 +619,8 @@ class FridayGUI:
         self._build_commands_tab(self.tab_commands)
         self._build_system_tab(self.tab_system)
         self._build_camera_tab(self.tab_camera)
+        self._build_maps_tab(self.tab_maps)
+        self._build_share_tab(self.tab_share)
         self._build_youtube_tab(self.tab_youtube)
         self._build_files_tab(self.tab_files)
         self._build_windows_panel(right)
@@ -921,6 +969,41 @@ class FridayGUI:
             font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
         ).pack(side="left")
 
+        toggles2 = ctk.CTkFrame(card, fg_color="transparent")
+        toggles2.pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkSwitch(
+            toggles2,
+            text="SCREENSHOT (gesture)",
+            variable=self._screenshot_enabled,
+            command=self._on_screenshot_toggle,
+            fg_color="#1b2735",
+            progress_color=self.colors.accent,
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).pack(side="left", padx=(0, 12))
+
+        ctk.CTkLabel(
+            toggles2,
+            text="Fist action",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).pack(side="left", padx=(0, 10))
+
+        ctk.CTkOptionMenu(
+            toggles2,
+            values=["Stop listening", "Screenshot", "Both"],
+            variable=self._fist_action,
+            fg_color="#1b2735",
+            button_color="#1b2735",
+            button_hover_color="#24384e",
+            dropdown_fg_color="#0b1633",
+            dropdown_text_color=self.colors.text,
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            height=32,
+        ).pack(side="left")
+
         self.gesture_start_btn = ctk.CTkButton(
             row,
             text="START",
@@ -1166,6 +1249,53 @@ class FridayGUI:
         else:
             self.toast("Close window disabled.", level="ok")
 
+    def _on_screenshot_toggle(self):
+        if bool(self._screenshot_enabled.get()):
+            if pyautogui is None and Image is None:
+                self._screenshot_enabled.set(False)
+                self.toast("Screenshot unavailable (missing Pillow/pyautogui).", level="error", ms=4500)
+                return
+            self.toast("Screenshot enabled.", level="ok")
+        else:
+            self.toast("Screenshot disabled.", level="ok")
+
+    def take_screenshot(self) -> str | None:
+        screenshots_dir = os.path.join(os.path.dirname(__file__), "screenshots")
+        os.makedirs(screenshots_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(screenshots_dir, f"friday-{ts}.png")
+
+        try:
+            if pyautogui is not None:
+                img = pyautogui.screenshot()
+                img.save(path)
+                self.toast("Screenshot saved.", level="ok")
+                self.log(f"Screenshot: {path}")
+                return path
+        except Exception as e:
+            self.log(f"Screenshot failed (pyautogui): {e}")
+
+        # Fallback: try PIL ImageGrab (may not work on Linux without X/Wayland setup)
+        try:
+            from PIL import ImageGrab  # type: ignore
+
+            img = ImageGrab.grab()
+            img.save(path)
+            self.toast("Screenshot saved.", level="ok")
+            self.log(f"Screenshot: {path}")
+            return path
+        except Exception as e:
+            self.toast("Screenshot failed.", level="error")
+            self.log(f"Screenshot failed: {e}")
+            return None
+
+    def _on_fist_gesture(self):
+        action = str(self._fist_action.get() or "Stop listening")
+        if action in {"Stop listening", "Both"}:
+            self.stop_listening()
+        if action in {"Screenshot", "Both"} and bool(self._screenshot_enabled.get()):
+            self.take_screenshot()
+
     def _mouse_move_from_norm(self, x: float, y: float):
         if pyautogui is None:
             return
@@ -1297,6 +1427,345 @@ class FridayGUI:
         if bool(self._close_window_enabled.get()):
             self._close_active_window()
 
+    def _build_maps_tab(self, parent):
+        head = ctk.CTkFrame(parent, fg_color="transparent")
+        head.pack(fill="x", padx=12, pady=(12, 8))
+        ctk.CTkLabel(
+            head,
+            text="Maps (OpenStreetMap)",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+        ).pack(anchor="w")
+
+        note = ctk.CTkLabel(
+            head,
+            text="This opens maps in your browser (no API key).",
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            justify="left",
+        )
+        note.pack(anchor="w", pady=(4, 0))
+
+        card = ctk.CTkFrame(parent, fg_color=self.colors.panel, corner_radius=12)
+        card.pack(fill="x", padx=12, pady=(8, 12))
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=(12, 12))
+
+        self.maps_query = ctk.StringVar(value="")
+        entry = ctk.CTkEntry(
+            row,
+            textvariable=self.maps_query,
+            placeholder_text="Search location… (e.g., 'New York' or '1600 Pennsylvania Ave')",
+            fg_color="#000814",
+            text_color=self.colors.text,
+            placeholder_text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            height=36,
+        )
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        entry.bind("<Return>", lambda e: self.open_map_search())
+
+        ctk.CTkButton(
+            row,
+            text="OPEN",
+            command=self.open_map_search,
+            fg_color=self.colors.accent,
+            hover_color="#29f2ff",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=120,
+            height=36,
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            row,
+            text="OPEN LOCAL IP",
+            command=self.open_local_ip_in_browser,
+            fg_color="#1b2735",
+            hover_color="#24384e",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=160,
+            height=36,
+        ).pack(side="left", padx=(10, 0))
+
+    def open_map_search(self):
+        q = (self.maps_query.get() or "").strip()
+        if not q:
+            self.toast("Type a location first.", level="warn")
+            return
+        url = "https://www.openstreetmap.org/search?query=" + q.replace(" ", "+")
+        try:
+            webbrowser.open(url)
+            self.toast("Opened map in browser.", level="ok")
+        except Exception as e:
+            self.toast(f"Could not open browser: {e}", level="error", ms=4500)
+
+    def open_local_ip_in_browser(self):
+        ip = _get_local_ip()
+        try:
+            webbrowser.open(f"http://{ip}:5000")
+        except Exception:
+            pass
+
+    # ---------------------------
+    # Screen share (LAN)
+    # ---------------------------
+    def _build_share_tab(self, parent):
+        head = ctk.CTkFrame(parent, fg_color="transparent")
+        head.pack(fill="x", padx=12, pady=(12, 8))
+        ctk.CTkLabel(
+            head,
+            text="Share (View-Only) — LAN Browser",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+        ).pack(anchor="w")
+
+        warn = (
+            "Security: this shares your screen to anyone on your network who has the link + token.\n"
+            "Do not use on public Wi‑Fi."
+        )
+        ctk.CTkLabel(
+            head,
+            text=warn,
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+        card = ctk.CTkFrame(parent, fg_color=self.colors.panel, corner_radius=12)
+        card.pack(fill="x", padx=12, pady=(8, 12))
+
+        self.share_running = False
+        self.share_port = ctk.IntVar(value=5000)
+        self.share_fps = ctk.IntVar(value=5)
+        self.share_token = ctk.StringVar(value=secrets.token_urlsafe(12))
+        self.share_status = ctk.StringVar(value="Server: stopped")
+        self._share_thread = None
+        self._share_server = None
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=(12, 8))
+
+        ctk.CTkLabel(row, text="Port", text_color=self.colors.text, font=ctk.CTkFont(family="Consolas", size=11, weight="bold")).pack(side="left", padx=(0, 8))
+        ctk.CTkEntry(row, textvariable=self.share_port, width=90, fg_color="#000814", text_color=self.colors.text, font=ctk.CTkFont(family="Consolas", size=12), height=32).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(row, text="FPS", text_color=self.colors.text, font=ctk.CTkFont(family="Consolas", size=11, weight="bold")).pack(side="left", padx=(0, 8))
+        ctk.CTkEntry(row, textvariable=self.share_fps, width=70, fg_color="#000814", text_color=self.colors.text, font=ctk.CTkFont(family="Consolas", size=12), height=32).pack(side="left", padx=(0, 12))
+
+        ctk.CTkLabel(row, text="Token", text_color=self.colors.text, font=ctk.CTkFont(family="Consolas", size=11, weight="bold")).pack(side="left", padx=(0, 8))
+        ctk.CTkEntry(row, textvariable=self.share_token, width=220, fg_color="#000814", text_color=self.colors.text, font=ctk.CTkFont(family="Consolas", size=12), height=32).pack(side="left", padx=(0, 12))
+
+        self.share_start_btn = ctk.CTkButton(
+            row,
+            text="START",
+            command=self.start_share_server,
+            fg_color=self.colors.ok,
+            hover_color="#1fe27a",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=120,
+            height=32,
+        )
+        self.share_start_btn.pack(side="left", padx=(0, 10))
+
+        self.share_stop_btn = ctk.CTkButton(
+            row,
+            text="STOP",
+            command=self.stop_share_server,
+            fg_color=self.colors.danger,
+            hover_color="#ff4a68",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=120,
+            height=32,
+            state="disabled",
+        )
+        self.share_stop_btn.pack(side="left")
+
+        row2 = ctk.CTkFrame(card, fg_color="transparent")
+        row2.pack(fill="x", padx=12, pady=(0, 12))
+        ctk.CTkLabel(row2, textvariable=self.share_status, text_color=self.colors.text, font=ctk.CTkFont(family="Consolas", size=11)).pack(side="left")
+
+        ctk.CTkButton(
+            row2,
+            text="OPEN LINK",
+            command=self.open_share_link,
+            fg_color=self.colors.accent,
+            hover_color="#29f2ff",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=140,
+            height=32,
+        ).pack(side="right")
+
+    def _share_auth_ok(self) -> bool:
+        return True
+
+    def _share_capture_jpeg(self) -> bytes | None:
+        if pyautogui is None:
+            return None
+        try:
+            img = pyautogui.screenshot()
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=70, optimize=True)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    def _share_windows_list(self) -> list[str]:
+        titles = []
+        try:
+            if self._has_xdotool():
+                ids = self._xdotool("search", "--onlyvisible", "--name", ".")
+                for wid in [l.strip() for l in ids.splitlines() if l.strip()][:40]:
+                    try:
+                        t = self._xdotool("getwindowname", wid).strip()
+                        if t:
+                            titles.append(t)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return titles
+
+    def start_share_server(self):
+        if Flask is None or Response is None or request is None:
+            self.toast("Flask not available; share server disabled.", level="error", ms=4500)
+            return
+        if self.share_running:
+            return
+
+        port = int(self.share_port.get())
+        fps = max(1, min(int(self.share_fps.get()), 20))
+        token = str(self.share_token.get()).strip()
+        if not token:
+            token = secrets.token_urlsafe(12)
+            self.share_token.set(token)
+
+        app = Flask("friday_share")
+        self._share_app = app
+
+        def check_token(req) -> bool:
+            try:
+                return (req.args.get("token") or "") == token
+            except Exception:
+                return False
+
+        @app.get("/")
+        def index():
+            if not check_token(request):
+                return ("Forbidden", 403)
+            ip = _get_local_ip()
+            html = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>FRIDAY Share</title>
+  <style>
+    body {{ font-family: monospace; background:#050816; color:#e0f7fa; margin:0; }}
+    .top {{ padding:12px 16px; background:#0b1633; }}
+    .grid {{ display:grid; grid-template-columns: 1fr 360px; gap:12px; padding:12px 16px; }}
+    .card {{ background:#081229; border:1px solid #00e5ff33; border-radius:12px; padding:12px; }}
+    img {{ width:100%; border-radius:10px; border:1px solid #00e5ff33; }}
+    a {{ color:#00e5ff; }}
+  </style>
+</head>
+<body>
+  <div class="top">FRIDAY Share — view-only — {ip}:{port}</div>
+  <div class="grid">
+    <div class="card">
+      <div>Live Screen</div>
+      <img src="/stream.mjpg?token={token}" />
+    </div>
+    <div class="card">
+      <div>Windows</div>
+      <pre id="wins">Loading…</pre>
+      <script>
+        async function refresh() {{
+          const r = await fetch('/windows?token={token}');
+          document.getElementById('wins').textContent = await r.text();
+        }}
+        refresh();
+        setInterval(refresh, 2000);
+      </script>
+    </div>
+  </div>
+</body>
+</html>
+"""
+            return html
+
+        @app.get("/windows")
+        def windows():
+            if not check_token(request):
+                return ("Forbidden", 403)
+            titles = self._share_windows_list()
+            return "\n".join(f"- {t}" for t in titles) + ("\n" if titles else "No windows.\n")
+
+        @app.get("/stream.mjpg")
+        def stream():
+            if not check_token(request):
+                return ("Forbidden", 403)
+
+            def gen():
+                delay = 1.0 / float(fps)
+                while self.share_running:
+                    frame = self._share_capture_jpeg()
+                    if not frame:
+                        time.sleep(delay)
+                        continue
+                    yield (b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+                    time.sleep(delay)
+
+            return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+        def run_server():
+            try:
+                from werkzeug.serving import make_server
+
+                srv = make_server("0.0.0.0", port, app, threaded=True)
+                self._share_server = srv
+                srv.serve_forever()
+            except Exception as e:
+                self.root.after(0, lambda: self.toast(f"Share server failed: {e}", level="error", ms=4500))
+
+        self.share_running = True
+        self._share_thread = threading.Thread(target=run_server, daemon=True)
+        self._share_thread.start()
+
+        self.share_start_btn.configure(state="disabled")
+        self.share_stop_btn.configure(state="normal")
+        ip = _get_local_ip()
+        self.share_status.set(f"Server: running — http://{ip}:{port}/?token={token}")
+        self.toast("Share server started.", level="ok")
+
+    def stop_share_server(self):
+        self.share_running = False
+        try:
+            if self._share_server:
+                self._share_server.shutdown()
+        except Exception:
+            pass
+        self._share_server = None
+        try:
+            self.share_start_btn.configure(state="normal")
+            self.share_stop_btn.configure(state="disabled")
+        except Exception:
+            pass
+        self.share_status.set("Server: stopped")
+        self.toast("Share server stopped.", level="ok")
+
+    def open_share_link(self):
+        ip = _get_local_ip()
+        port = int(self.share_port.get())
+        token = str(self.share_token.get()).strip()
+        try:
+            webbrowser.open(f"http://{ip}:{port}/?token={token}")
+        except Exception:
+            pass
+
     def test_camera(self):
         try:
             import cv2  # type: ignore
@@ -1399,7 +1868,7 @@ class FridayGUI:
         try:
             self.gesture_controller = GestureController(
                 on_open_hand=lambda: self.root.after(0, self.start_listening),
-                on_closed_fist=lambda: self.root.after(0, self.stop_listening),
+                on_closed_fist=lambda: self.root.after(0, self._on_fist_gesture),
                 on_two_fingers_hold=lambda: self.root.after(0, self._open_camera_tab),
                 on_two_fingers_tap=lambda: self.root.after(0, self._gesture_click),
                 on_open_palm=lambda: self.root.after(0, self._gesture_open_palm_action),
