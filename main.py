@@ -531,6 +531,46 @@ class FridayGUI:
         self.root.bind("<Escape>", lambda e: self.stop_listening())
 
         self.refresh_window_list()
+        self._toast_widget = None
+
+    def toast(self, message: str, level: str = "info", ms: int = 3200):
+        try:
+            if self._toast_widget and self._toast_widget.winfo_exists():
+                self._toast_widget.destroy()
+        except Exception:
+            pass
+
+        bg = self.colors.panel_2
+        border = self.colors.accent
+        text_color = self.colors.text
+        if level == "ok":
+            border = self.colors.ok
+        elif level == "warn":
+            border = self.colors.warn
+        elif level == "error":
+            border = self.colors.danger
+
+        frame = ctk.CTkFrame(self.root, fg_color=bg, corner_radius=12, border_width=2, border_color=border)
+        label = ctk.CTkLabel(
+            frame,
+            text=message,
+            text_color=text_color,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            justify="left",
+            wraplength=520,
+        )
+        label.pack(padx=14, pady=10)
+        frame.place(relx=1.0, rely=1.0, anchor="se", x=-18, y=-18)
+        self._toast_widget = frame
+
+        def _hide():
+            try:
+                if frame.winfo_exists():
+                    frame.destroy()
+            except Exception:
+                pass
+
+        self.root.after(ms, _hide)
 
     def _build_console_tab(self, parent):
         ctk.CTkLabel(
@@ -1625,6 +1665,7 @@ class FridayGUI:
         try:
             os.makedirs(target, exist_ok=False)
             self.log(f"Folder created: {target}")
+            self.toast("Folder created.", level="ok")
             try:
                 self.voice_engine.speak("Folder created.")
             except Exception:
@@ -1632,6 +1673,7 @@ class FridayGUI:
             self._voice_form_reset()
         except Exception as e:
             self.log(f"Create folder failed: {e}")
+            self.toast("Create folder failed.", level="error")
             try:
                 self.voice_engine.speak("I couldn't create that folder.")
             except Exception:
@@ -1949,8 +1991,10 @@ class FridayGUI:
                 ydl.download([url])
 
             self.root.after(0, lambda: self.log("Download complete."))
+            self.root.after(0, lambda: self.toast("Download complete.", level="ok"))
         except Exception as e:
             self.root.after(0, lambda: self.log(f"Download failed: {e}"))
+            self.root.after(0, lambda: self.toast("Download failed.", level="error"))
         finally:
             self.root.after(0, lambda: self.update_status("Ready", self.colors.ok))
             self.root.after(
@@ -2034,8 +2078,10 @@ class FridayGUI:
 
             shutil.move(src, dest_path)
             self.root.after(0, lambda: self.log(f"Move complete: {dest_path}"))
+            self.root.after(0, lambda: self.toast("Move complete.", level="ok"))
         except Exception as e:
             self.root.after(0, lambda: self.log(f"Move failed: {e}"))
+            self.root.after(0, lambda: self.toast("Move failed.", level="error"))
         finally:
             self.root.after(0, lambda: self.update_status("Ready", self.colors.ok))
             self.root.after(0, lambda: self.move_button.configure(state="normal"))
