@@ -143,6 +143,7 @@ class FridayGUI:
 
         self.is_listening = False
         self.is_hidden = False
+        self.wake_word_enabled = True
 
         self._window_handles: list[object] = []
         self._download_thread: threading.Thread | None = None
@@ -385,6 +386,32 @@ class FridayGUI:
             height=36,
         )
         help_button.pack(side="left", padx=(0, 10))
+
+        hide_button = ctk.CTkButton(
+            controls,
+            text="HIDE",
+            command=self.hide_interface,
+            fg_color="#1b2735",
+            hover_color="#24384e",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=90,
+            height=36,
+        )
+        hide_button.pack(side="left", padx=(0, 10))
+
+        self._wake_var = ctk.BooleanVar(value=True)
+        wake_switch = ctk.CTkSwitch(
+            controls,
+            text="WAKE WORD",
+            variable=self._wake_var,
+            command=self.toggle_wake_word,
+            fg_color="#1b2735",
+            progress_color=self.colors.accent,
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        )
+        wake_switch.pack(side="left", padx=(0, 10))
 
         self._chatbot_var = ctk.BooleanVar(value=False)
         self.chatbot_switch = ctk.CTkSwitch(
@@ -1208,6 +1235,9 @@ class FridayGUI:
             return
 
         lowered = text.lower()
+        if any(w in lowered for w in ("hide", "sleep", "go to sleep")):
+            self.hide_interface()
+            return
         if ("create" in lowered and "folder" in lowered) or "new folder" in lowered:
             self._voice_form_start_create_folder()
             return
@@ -1232,7 +1262,11 @@ class FridayGUI:
                     time.sleep(1)
                     continue
 
-                if self.is_hidden and hasattr(self.voice_engine, "listen_offline"):
+                if (
+                    self.wake_word_enabled
+                    and self.is_hidden
+                    and hasattr(self.voice_engine, "listen_offline")
+                ):
                     result = self.voice_engine.listen_offline(timeout=2)
                     if (result or "").strip().lower() == "friday":
                         self.root.after(0, self.show_interface)
@@ -1253,6 +1287,28 @@ class FridayGUI:
         except Exception:
             pass
         self.start_listening()
+
+    def hide_interface(self):
+        self.is_hidden = True
+        try:
+            self.stop_listening()
+        except Exception:
+            pass
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        try:
+            self.voice_engine.speak("Standing by.")
+        except Exception:
+            pass
+
+    def toggle_wake_word(self):
+        try:
+            self.wake_word_enabled = bool(self._wake_var.get())
+            self.log(f"Wake word: {'ON' if self.wake_word_enabled else 'OFF'}")
+        except Exception:
+            pass
 
     def toggle_chatbot(self):
         try:
@@ -1740,6 +1796,9 @@ class FridayGUI:
             return False
 
         cmd = parts[0].lower()
+        if cmd in {"hide", "sleep"}:
+            self.hide_interface()
+            return True
         if cmd == "download" and len(parts) >= 2:
             url = parts[1]
             out_dir = parts[2] if len(parts) >= 3 else self.yt_out_dir.get()
