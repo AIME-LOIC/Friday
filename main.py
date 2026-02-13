@@ -177,16 +177,8 @@ class FridayGUI:
         else:
             self.command_processor = CommandProcessor(self.voice_engine, memory_store)
 
-        if GestureController is None:
-            self.gesture_controller = None
-        else:
-            try:
-                self.gesture_controller = GestureController(
-                    on_open_hand=self.start_listening,
-                    on_closed_fist=self.stop_listening,
-                )
-            except Exception:
-                self.gesture_controller = None
+        self.gesture_controller = None
+        self._gesture_status = ctk.StringVar(value="Gestures: not started")
 
         self._build_ui()
         self.update_voice_settings()
@@ -523,12 +515,14 @@ class FridayGUI:
         self.tab_console = self.tabs.add("Console")
         self.tab_commands = self.tabs.add("Commands")
         self.tab_system = self.tabs.add("System")
+        self.tab_camera = self.tabs.add("Camera")
         self.tab_youtube = self.tabs.add("YouTube")
         self.tab_files = self.tabs.add("Files")
 
         self._build_console_tab(self.tab_console)
         self._build_commands_tab(self.tab_commands)
         self._build_system_tab(self.tab_system)
+        self._build_camera_tab(self.tab_camera)
         self._build_youtube_tab(self.tab_youtube)
         self._build_files_tab(self.tab_files)
         self._build_windows_panel(right)
@@ -743,6 +737,128 @@ class FridayGUI:
 
         self._refresh_system_tab()
 
+    def _build_camera_tab(self, parent):
+        head = ctk.CTkFrame(parent, fg_color="transparent")
+        head.pack(fill="x", padx=12, pady=(12, 8))
+        ctk.CTkLabel(
+            head,
+            text="Camera / Gesture Control",
+            text_color=self.colors.accent,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+        ).pack(anchor="w")
+
+        info = ctk.CTkLabel(
+            head,
+            text="If gestures don't work, your camera may be on index 1 or 2.\n"
+            "Select an index, click TEST, then START.",
+            text_color=self.colors.muted,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            justify="left",
+        )
+        info.pack(anchor="w", pady=(4, 0))
+
+        card = ctk.CTkFrame(parent, fg_color=self.colors.panel, corner_radius=12)
+        card.pack(fill="x", padx=12, pady=(8, 12))
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=(12, 10))
+
+        cfg_cam = self._get_config("customization", "camera_index", default=0)
+        try:
+            cfg_cam = int(cfg_cam)
+        except Exception:
+            cfg_cam = 0
+        self.camera_index_var = ctk.IntVar(value=cfg_cam)
+
+        ctk.CTkLabel(
+            row,
+            text="Camera index",
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+        ).pack(side="left", padx=(0, 10))
+
+        idx_menu = ctk.CTkOptionMenu(
+            row,
+            values=["0", "1", "2", "3"],
+            variable=ctk.StringVar(value=str(cfg_cam)),
+            command=lambda v: self._on_camera_index_changed(v),
+            fg_color="#1b2735",
+            button_color="#1b2735",
+            button_hover_color="#24384e",
+            dropdown_fg_color="#0b1633",
+            dropdown_text_color=self.colors.text,
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            height=34,
+            width=90,
+        )
+        idx_menu.pack(side="left")
+
+        test_btn = ctk.CTkButton(
+            row,
+            text="TEST",
+            command=self.test_camera,
+            fg_color=self.colors.accent,
+            hover_color="#29f2ff",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=110,
+            height=34,
+        )
+        test_btn.pack(side="left", padx=(14, 0))
+
+        self.gesture_start_btn = ctk.CTkButton(
+            row,
+            text="START",
+            command=self.start_gestures,
+            fg_color=self.colors.ok,
+            hover_color="#1fe27a",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=120,
+            height=34,
+        )
+        self.gesture_start_btn.pack(side="left", padx=(14, 0))
+
+        self.gesture_stop_btn = ctk.CTkButton(
+            row,
+            text="STOP",
+            command=self.stop_gestures,
+            fg_color=self.colors.danger,
+            hover_color="#ff4a68",
+            text_color=self.colors.bg,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            width=120,
+            height=34,
+            state="disabled",
+        )
+        self.gesture_stop_btn.pack(side="left", padx=(10, 0))
+
+        status_row = ctk.CTkFrame(card, fg_color="transparent")
+        status_row.pack(fill="x", padx=12, pady=(0, 12))
+
+        ctk.CTkLabel(
+            status_row,
+            textvariable=self._gesture_status,
+            text_color=self.colors.text,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            justify="left",
+        ).pack(anchor="w")
+
+        deps = []
+        if GestureController is None:
+            deps.append("GestureController import failed (check deps).")
+        try:
+            import cv2  # type: ignore
+        except Exception:
+            deps.append("OpenCV (cv2) missing.")
+        try:
+            import mediapipe  # type: ignore
+        except Exception:
+            deps.append("MediaPipe missing.")
+        if deps:
+            self._gesture_status.set("Gestures: unavailable — " + " ".join(deps))
+
     def _refresh_system_tab(self):
         lines = []
         now = datetime.datetime.now()
@@ -805,6 +921,100 @@ class FridayGUI:
         except Exception:
             pass
         self.root.after(400, self._refresh_indicators)
+
+    # ---------------------------
+    # Camera / gestures
+    # ---------------------------
+    def _on_camera_index_changed(self, value: str):
+        try:
+            idx = int(str(value).strip())
+        except Exception:
+            idx = 0
+        self.camera_index_var.set(idx)
+        self._set_config("customization", "camera_index", value=idx)
+        self._schedule_config_write()
+        self._gesture_status.set(f"Gestures: camera set to {idx}")
+
+    def _gesture_set_status(self, msg: str):
+        self._gesture_status.set(f"Gestures: {msg}")
+
+    def test_camera(self):
+        try:
+            import cv2  # type: ignore
+        except Exception as e:
+            messagebox.showerror("OpenCV missing", f"cv2 import failed: {e}")
+            return
+
+        idx = int(self.camera_index_var.get())
+        cap = cv2.VideoCapture(idx)
+        ok = bool(cap.isOpened())
+        try:
+            if ok:
+                ret, _frame = cap.read()
+                ok = ok and bool(ret)
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+        if ok:
+            self.toast(f"Camera {idx} OK.", level="ok")
+            self._gesture_set_status(f"camera {idx} OK")
+        else:
+            self.toast(f"Camera {idx} failed to open.", level="error")
+            self._gesture_set_status(f"camera {idx} failed")
+
+    def start_gestures(self):
+        if GestureController is None:
+            self.toast("Gesture controller unavailable (missing deps).", level="error")
+            return
+
+        idx = int(getattr(self, "camera_index_var", ctk.IntVar(value=0)).get())
+
+        def dispatch(fn):
+            try:
+                self.root.after(0, fn)
+            except Exception:
+                pass
+
+        def on_status(msg: str):
+            self._gesture_set_status(msg)
+            self.log(f"Gesture status: {msg}")
+
+        try:
+            self.gesture_controller = GestureController(
+                on_open_hand=lambda: self.root.after(0, self.start_listening),
+                on_closed_fist=lambda: self.root.after(0, self.stop_listening),
+                camera_index=idx,
+                start_immediately=True,
+                cooldown_s=1.2,
+                on_status=on_status,
+                dispatcher=dispatch,
+                show_preview=False,
+            )
+            self.gesture_start_btn.configure(state="disabled")
+            self.gesture_stop_btn.configure(state="normal")
+            self.toast("Gesture control started.", level="ok")
+        except Exception as e:
+            self.gesture_controller = None
+            self.toast(f"Gesture start failed: {e}", level="error", ms=4500)
+            self._gesture_set_status(f"start failed: {e}")
+
+    def stop_gestures(self):
+        try:
+            if self.gesture_controller:
+                self.gesture_controller.stop()
+        except Exception:
+            pass
+        self.gesture_controller = None
+        try:
+            self.gesture_start_btn.configure(state="normal")
+            self.gesture_stop_btn.configure(state="disabled")
+        except Exception:
+            pass
+        self.toast("Gesture control stopped.", level="ok")
+        self._gesture_set_status("stopped")
 
     def _build_youtube_tab(self, parent):
         top = ctk.CTkFrame(parent, fg_color="transparent")
